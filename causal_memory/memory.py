@@ -310,10 +310,10 @@ class CausalMemory:
         Returns a plain-sentence answer.
         """
         llm = self._get_llm()
-        events = self._recent_events(limit=50)
+        events = self._recent_events(limit=10000)
         event_digest = "\n".join(
             f"- id {e.id}: {e.text} (session {e.session_id}, topic {e.topic})"
-            for e in events
+            for e in events[-250:]  # newest 250 for LLM digestion
         )
 
         # 1. Resolve the question to a target event id.
@@ -345,8 +345,8 @@ class CausalMemory:
             return f'No causal chain recorded yet for "{label}". ' \
                    "Log more observations and run extract_causality() to discover one."
 
-        # 3. Narrate the best (shortest) path.
-        best = min(paths, key=lambda p: len(p.events))
+        # 3. Narrate the most complete (longest) causal chain.
+        best = max(paths, key=lambda p: len(p.events))
         chain_lines = []
         for i, ev in enumerate(best.events):
             chain_lines.append(f"event {ev.id} @ t={ev.timestamp}: {ev.text}")
@@ -385,22 +385,54 @@ class CausalMemory:
         if len(events) < 2:
             return 0
 
-        digest = "\n".join(
-            f"- id {e.id} | t={e.timestamp} | session={e.session_id} | "
-            f"topic={e.topic} | text={e.text}"
-            for e in events
-        )
+        # Large streams are digested in overlapping temporal windows; a single
+        # 80+ event digest makes the LLM under-propose and miss chain links.
+        windows = self._temporal_windows(events)
+        total = 0
+        for win in windows:
+            total += self._discover_in_window(win)
+        return total
+
+    def _temporal_windows(self, events: List[Event], size: int = 18, overlap: int = 6) -> List[List[Event]]:
+        """Split a sorted event list into overlapping windows."""
+        if len(events) <= size:
+            return [events]
+        windows = []
+        step = size - overlap
+        for start in range(0, len(events), step):
+            win = events[start : start + size]
+            if len(win) >= 2:
+                windows.append(win)
+            if start + size >= len(events):
+                break
+        return windows
+
+    def _discover_in_window(self, events: List[Event]) -> int:
+        """Run LLM causal discovery over one window. Returns edges written."""
+        llm = self._get_llm()
+        digest_lines = []
+        for i, e in enumerate(events):
+            digest_lines.append(
+                f"[{i}] t={e.timestamp} session={e.session_id} "
+                f"topic={e.topic} text={e.text}"
+            )
+        digest = "\n".join(digest_lines)
         edges_json = llm.complete(
             system=(
-                "You are a causal-discovery assistant. Given a time-ordered list of "
-                "observations from an agent session, propose which events CAUSED which. "
-                "Rules:\n"
-                "- A cause must precede its effect in time (lower t).\n"
-                "- Only propose causal links you can justify with a mechanism.\n"
-                "- Do not invent causes from correlation alone.\n"
-                "- Return JSON: {\"edges\": [{\"source_id\": <int>, \"target_id\": <int>, "
-                "\"confidence\": 0.0-1.0, \"mechanism\": \"<why>\"}]}. "
-                "At most one edge per pair. Prefer few, high-confidence edges."
+                "You are a causal-discovery assistant for an agent memory graph. "
+                "Given a time-ordered list of observations, propose every "
+                "defensible CAUSE->EFFECT pair. The events are indexed [0], [1], "
+                "... with increasing time. Rules:\n"
+                "- A cause index must be LESS than its effect index (cause "
+                "happens earlier).\n"
+                "- Only propose genuine pairs with a clear mechanism; state it.\n"
+                "- If A->B and B->C are both real, emit both edges.\n"
+                "- Confidence reflects causal strength, not just temporal "
+                "proximity. Prefer a few strong edges over many weak ones.\n"
+                "- Return JSON ONLY: {\"edges\": [{\"source_idx\": <int>, "
+                "\"target_idx\": <int>, \"confidence\": 0.0-1.0, "
+                "\"mechanism\": \"<why>\"}]}. Use the index numbers, never "
+                "event ids."
             ),
             user=digest,
             json_mode=True,
@@ -413,15 +445,23 @@ class CausalMemory:
         written = 0
         for edge in edges:
             try:
-                src = int(edge.get("source_id"))
-                dst = int(edge.get("target_id"))
-                if src == dst:
+                src_idx = int(edge.get("source_idx"))
+                dst_idx = int(edge.get("target_idx"))
+                # validate indices and temporal ordering
+                if src_idx == dst_idx:
                     continue
+                if not (0 <= src_idx < len(events) and 0 <= dst_idx < len(events)):
+                    continue
+                if events[src_idx].timestamp > events[dst_idx].timestamp:
+                    continue
+                src = events[src_idx]
+                dst = events[dst_idx]
                 conf = float(edge.get("confidence", 0.5))
+                conf = max(0.0, min(1.0, conf))
                 mech = edge.get("mechanism") or None
                 self.add_causal_relation(
-                    source_id=src,
-                    target_id=dst,
+                    source_id=src.id,
+                    target_id=dst.id,
                     relation_type="CAUSES",
                     confidence=conf,
                     mechanism=mech,
@@ -471,7 +511,7 @@ class CausalMemory:
         best_id = None
         best_score = 0
         best_timestamp = -1
-        for e in self._recent_events(limit=100):
+        for e in self._recent_events(limit=10000):
             ewords = set(re.findall(r"[a-z0-9]+", e.text.lower()))
             score = len(qwords & ewords)
             if score > best_score or (score == best_score and e.timestamp > best_timestamp):
