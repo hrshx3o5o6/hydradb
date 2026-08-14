@@ -21,17 +21,18 @@ def main():
     
     # Initialize memory
     memory = CausalMemory(
-        url="http://localhost:18443",
-        auth_token="local-dev-auth-token-32-characters-long"
+        url="http://localhost:8443",
+        auth_token="local-dev-auth-token-32-characters-long",
+        admin_url="http://localhost:9090"
     )
     
     # Check connection
     print("\n1. Checking HydraDB connection...")
-    if memory.client.health_check():
+    if memory.client.health_check() or memory.client.ready_check():
         print("   ✓ HydraDB is healthy")
     else:
         print("   ✗ Cannot connect to HydraDB")
-        print("   Make sure HydraDB is running on localhost:18443")
+        print("   Make sure HydraDB is running on localhost:8443")
         sys.exit(1)
     
     # Create events
@@ -124,12 +125,12 @@ def main():
     results = memory.search("San Francisco")
     print(f"   Search 'San Francisco': {len(results)} result(s)")
     for r in results:
-        print(f"     - {r['text']}")
-    
+        print(f"     - {r.text}")
+
     results = memory.search("dark mode")
     print(f"   Search 'dark mode': {len(results)} result(s)")
     for r in results:
-        print(f"     - {r['text']}")
+        print(f"     - {r.text}")
     
     # Test current fact retrieval
     print("\n6. Testing current fact retrieval...")
