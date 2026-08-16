@@ -147,7 +147,8 @@ PAGE = """<!doctype html>
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
 
   #view { flex:1; position:relative; overflow:hidden; background:var(--bg); }
-  svg { width:100%; height:100%; display:block; }
+  svg { width:100%; height:100%; display:block; cursor:grab; touch-action:none; }
+  svg.panning { cursor:grabbing; }
 
   .edge { stroke:var(--faint); stroke-width:1; opacity:.5; transition:opacity .2s; }
   .edge.edge-CAUSES { stroke:var(--accent); stroke-width:1.4; opacity:.85; }
@@ -160,18 +161,15 @@ PAGE = """<!doctype html>
     stroke-width:inherit } }
   .edge:hover { opacity:1; stroke-width:2; }
 
-  .node { cursor:pointer; }
-  .node rect { fill:var(--bg2); stroke:var(--faint); stroke-width:1; rx:2; }
-  .node:hover rect { stroke:var(--ink); }
-  .node .lab { fill:var(--ink); font-size:10px; letter-spacing:.04em;
-               text-anchor:start; }
-  .node .meta { fill:var(--faint); font-size:8px; letter-spacing:.1em;
-                text-anchor:start; }
-  .node.new { animation:popIn .5s cubic-bezier(.2,1.4,.4,1) both; }
-  .node.new rect { stroke:var(--accent); stroke-width:1.5; }
-  .node.new .lab { fill:var(--ink); }
-  @keyframes popIn { from { opacity:0; transform:scale(.6) } to { opacity:1;
-    transform:scale(1) } }
+  .node { cursor:move; }
+  .node circle { fill:var(--bg2); stroke:var(--faint); stroke-width:1.4; }
+  .node:hover circle { fill:var(--accent); stroke:var(--accent); }
+  .node .lab { fill:var(--dim); font-size:8px; letter-spacing:.05em;
+               text-anchor:middle; }
+  .node:hover .lab { fill:var(--ink); }
+  .node.new { animation:popIn .5s ease-out both; }
+  .node.new circle { stroke:var(--accent); fill:#26100A; }
+  @keyframes popIn { from { opacity:0 } to { opacity:1 } }
 
   #tooltip { position:absolute; display:none; z-index:20; pointer-events:none;
              max-width:360px; background:#16171B; border:1px solid var(--line);
@@ -213,8 +211,16 @@ PAGE = """<!doctype html>
 (function(){
   const NS = "http://www.w3.org/2000/svg";
   const svg = document.getElementById("svg");
+  const view = document.getElementById("view");
   const W = () => svg.clientWidth || 900, H = () => svg.clientHeight || 700;
   const tick = { nodes:{}, edges:{} };   // id -> our anim state
+  const textMap = {};                    // node id -> server node (label data)
+
+  const gRoot = el("g",{class:"mains"});
+  svg.appendChild(gRoot);
+  let cam = {x:0, y:0, k:1};             // pan + zoom
+  let drag = null;
+  let fitted = false;
 
   function el(name, attrs){
     const n = document.createElementNS(NS, name);
@@ -222,42 +228,86 @@ PAGE = """<!doctype html>
     return n;
   }
 
-  function simStep(pos){
-    // simple force layout: repulsion between all, springs along edges.
-    const ids = Object.keys(pos);
-    const k = 80, rep = 900;
-    const fx = {}, fy = {};
-    for (const id of ids){ fx[id]=0; fy[id]=0; }
-    for (let i=0;i<ids.length;i++){
-      const a = pos[ids[i]];
-      for (let j=i+1;j<ids.length;j++){
-        const b = pos[ids[j]];
-        let dx = a.x-b.x, dy = a.y-b.y;
-        let d2 = dx*dx+dy*dy; if (d2 < 1) d2 = 1;
-        let d = Math.sqrt(d2);
-        let f = rep/(d2);
-        dx/=d; dy/=d;
-        fx[a.id] += dx*f; fy[a.id] += dy*f;
-        fx[b.id] -= dx*f; fy[b.id] -= dy*f;
+  function applyCam(){
+    gRoot.setAttribute("transform",
+      "translate(" + cam.x + "," + cam.y + ") scale(" + cam.k + ")");
+    for (const l of labels) l.setAttribute("opacity", cam.k < .5 ? "0" : "1");
+  }
+
+  function fitAll(){
+    const ids = Object.keys(tick.nodes);
+    if (ids.length < 2) return;
+    let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
+    for (const id of ids){
+      const n = tick.nodes[id];
+      if (n.x<x0)x0=n.x; if (n.x>x1)x1=n.x;
+      if (n.y<y0)y0=n.y; if (n.y>y1)y1=n.y;
+    }
+    const w = (x1-x0)||1, h = (y1-y0)||1;
+    cam.k = Math.max(.2, Math.min(1.5, Math.min(W()/w, H()/h)*.85));
+    cam.x = W()/2 - (x0+x1)/2*cam.k;
+    cam.y = H()/2 - (y0+y1)/2*cam.k;
+    applyCam();
+  }
+
+  view.addEventListener("wheel", (ev)=>{
+    ev.preventDefault();
+    const rect = svg.getBoundingClientRect();
+    const px = ev.clientX-rect.left, py = ev.clientY-rect.top;
+    const k2 = cam.k * Math.exp(-ev.deltaY * .0012);
+    cam.k = Math.max(.1, Math.min(8, k2));
+    cam.x = px - (px - cam.x) * (cam.k / (cam.k*Math.exp(-ev.deltaY*.0012)));
+    cam.y = py - (py - cam.y) * (cam.k / (cam.k*Math.exp(-ev.deltaY*.0012)));
+    applyCam();
+  }, {passive:false});
+
+  view.addEventListener("mousedown", (ev)=>{
+    const node = ev.target.closest ? ev.target.closest(".node") : null;
+    if (node && node.__id != null){
+      drag = {mode:"node", id:node.__id, sx:ev.clientX, sy:ev.clientY,
+              ox:tick.nodes[node.__id].x, oy:tick.nodes[node.__id].y};
+      ev.preventDefault();
+    } else {
+      drag = {mode:"pan", sx:ev.clientX, sy:ev.clientY, ox:cam.x, oy:cam.y};
+      svg.classList.add("panning");
+      ev.preventDefault();
+    }
+  });
+  window.addEventListener("mousemove", (ev)=>{
+    if (!drag) return;
+    const dx = ev.clientX - drag.sx, dy = ev.clientY - drag.sy;
+    if (drag.mode === "pan"){
+      cam.x = drag.ox + dx; cam.y = drag.oy + dy;
+      applyCam();
+    } else {
+      const n = tick.nodes[drag.id];
+      if (n){
+        n.x = drag.ox + dx/cam.k; n.y = drag.oy + dy/cam.k;
+        n.vx = 0; n.vy = 0;
+        n._n.setAttribute("transform","translate("+n.x+","+n.y+")");
+        for (const e of Object.values(tick.edges)){
+          if (e.source!==drag.id && e.target!==drag.id) continue;
+          const a = tick.nodes[e.source], b = tick.nodes[e.target];
+          if (!a || !b) continue;
+          e._n.setAttribute("x1",a.x); e._n.setAttribute("y1",a.y);
+          e._n.setAttribute("x2",b.x); e._n.setAttribute("y2",b.y);
+        }
       }
     }
-    for (const e of Object.values(tick.edges)){
-      const a = pos[e.source], b = pos[e.target];
-      if (!a || !b) continue;
-      let dx = b.x-a.x, dy = b.y-a.y;
-      let d = Math.sqrt(dx*dx+dy*dy) || 1;
-      let f = (d - k) * 0.04;
-      dx/=d; dy/=d;
-      fx[a.id] += dx*f; fy[a.id] += dy*f;
-      fx[b.id] -= dx*f; fy[b.id] -= dy*f;
-    }
-    for (const id of ids){
-      pos[id].vx = (pos[id].vx||0)*0.85 + fx[id]*0.12;
-      pos[id].vy = (pos[id].vy||0)*0.85 + fy[id]*0.12;
-      pos[id].x += pos[id].vx; pos[id].y += pos[id].vy;
-      pos[id].x = Math.max(30, Math.min(W()-30, pos[id].x));
-      pos[id].y = Math.max(30, Math.min(H()-30, pos[id].y));
-    }
+  });
+  window.addEventListener("mouseup", ()=>{
+    drag = null; svg.classList.remove("panning");
+  });
+
+  // static sunflower layout: nodes are placed once and never moved again.
+  let placed = 0;
+  const labels = [];
+  const GOLDEN = 2.39996323;      // golden angle (radians)
+  function layoutPos(){
+    const i = placed++;
+    const rad = 30 * Math.sqrt(i);
+    return { x: W()/2 + rad*Math.cos(i*GOLDEN),
+             y: H()/2 + rad*Math.sin(i*GOLDEN) };
   }
 
   function render(data){
@@ -267,8 +317,9 @@ PAGE = """<!doctype html>
 
     for (const n of nodes){
       if (!tick.nodes[n.id]){
+        const p = layoutPos();
         tick.nodes[n.id] = {
-          id:n.id, x:Math.random()*W(), y:Math.random()*H(), vx:0, vy:0,
+          id:n.id, x:p.x, y:p.y, vx:0, vy:0,
           _n: el("g",{class:"node new"}),
         };
       }
@@ -281,10 +332,7 @@ PAGE = """<!doctype html>
         };
       }
     }
-    for (let i=0;i<6;i++) simStep(tick.nodes);
 
-    const gRoot = svg.querySelector("g.mains") ||
-      svg.appendChild(el("g",{class:"mains"}));
     for (const e of Object.values(tick.edges)){
       const a = tick.nodes[e.source], b = tick.nodes[e.target];
       if (!a || !b) continue;
@@ -294,39 +342,27 @@ PAGE = """<!doctype html>
     }
     for (const n of Object.values(tick.nodes)){
       const nn = n._n;
-      if (nn.__id == null){
-        nn.setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
-        if (!nn.parentNode) gRoot.appendChild(nn);
-        nn.__id = n.id;
-      } else {
-        nn.setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
-      }
-      if (!nn._done){
-        nn._done = true;
-        nn.appendChild(el("rect", {x:-5, y:-5, width:10, height:10}));
-        const g0 = textMap[n.id];
-        const text = (g0 && g0.text) || ("#" + n.id);
-        const short = text.length > 40 ? text.slice(0,40) + "…" : text;
-        const t1 = el("text", {class:"lab", x:12, y:2}); t1.textContent = short;
-        nn.appendChild(t1);
-        if (g0 && (g0.session_id || g0.topic)){
-          const meta = (g0.topic ? g0.topic : g0.session_id);
-          const t2 = el("text", {class:"meta", x:12, y:16});
-          t2.textContent = meta;
-          nn.appendChild(t2);
-        }
-      }
+      nn.setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
+      if (!nn.parentNode) gRoot.appendChild(nn);
+      nn.__id = n.id;
+      if (nn._done) continue;
+      nn._done = true;
+      nn.appendChild(el("circle", {r:8}));
+      const g0 = textMap[n.id];
+      const text = (g0 && g0.text) || ("#" + n.id);
+      const short = text.length > 30 ? text.slice(0,30) + "…" : text;
+      const t1 = el("text", {class:"lab", x:0, y:24}); t1.textContent = short;
+      nn.appendChild(t1);
+      labels.push(t1);
+    }
+    if (!fitted && Object.keys(tick.nodes).length > 1){
+      fitted = true; fitAll();
     }
   }
 
-  // map node ids to text on first paint
-  const textMap = {};
   function wireTooltips(data){
     const tt = document.getElementById("tooltip");
-    for (const n of data.nodes){
-      if (!textMap[n.id]) textMap[n.id] = n;
-    }
-    document.getElementById("view").onmousemove = (ev)=>{
+    view.onmousemove = (ev)=>{
       const g = document.elementFromPoint(ev.clientX, ev.clientY);
       const gEl = g && g.closest ? g.closest(".node") : null;
       if (!gEl){ tt.style.display = "none"; return; }
@@ -357,6 +393,7 @@ PAGE = """<!doctype html>
     try {
       const r = await fetch("/api/graph");
       const data = await r.json();
+      for (const n of data.nodes) if (!textMap[n.id]) textMap[n.id] = n;
       render(data); wireTooltips(data);
       document.getElementById("live").classList.remove("off");
       document.getElementById("live").lastChild.textContent = " LIVE";

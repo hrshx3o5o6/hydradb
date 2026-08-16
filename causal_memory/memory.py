@@ -410,6 +410,20 @@ class CausalMemory:
     def _discover_in_window(self, events: List[Event]) -> int:
         """Run LLM causal discovery over one window. Returns edges written."""
         llm = self._get_llm()
+        # Drop duplicate-text events: repeated mechanical actions (same tool
+        # invocation re-run, same log line) carry no causal signal and make the
+        # LLM chain near-identical texts together. Keep the first occurrence.
+        seen_texts = set()
+        uniq = []
+        for e in events:
+            key = (e.session_id, e.text)
+            if key in seen_texts:
+                continue
+            seen_texts.add(key)
+            uniq.append(e)
+        if len(uniq) < 2:
+            return 0
+        events = uniq
         digest_lines = []
         for i, e in enumerate(events):
             digest_lines.append(
@@ -429,6 +443,17 @@ class CausalMemory:
                 "- If A->B and B->C are both real, emit both edges.\n"
                 "- Confidence reflects causal strength, not just temporal "
                 "proximity. Prefer a few strong edges over many weak ones.\n"
+                "- NEVER link two events with identical or near-identical text "
+                "(a repeated action is not a cause of another repeated "
+                "action).\n"
+                "- Agent tool actions (text starts with 'tool:') are mechanical "
+                "steps. Do NOT chain consecutive tool actions into a causal "
+                "ladder unless one is the DIRECT, specific result of the other. "
+                "Prefer linking a user request or decision to the actions that "
+                "follow it.\n"
+                "- Prefer linking distinct-meaning events: a decision or user "
+                "request CAUSES the action that follows it; an action CAUSES "
+                "the result that directly derives from it.\n"
                 "- Return JSON ONLY: {\"edges\": [{\"source_idx\": <int>, "
                 "\"target_idx\": <int>, \"confidence\": 0.0-1.0, "
                 "\"mechanism\": \"<why>\"}]}. Use the index numbers, never "
@@ -456,8 +481,16 @@ class CausalMemory:
                     continue
                 src = events[src_idx]
                 dst = events[dst_idx]
+                # Mechanical tool->tool chains are noise, not memory. Only keep
+                # action edges when a non-action event (user request, decision,
+                # result) is on one end. User->action and decision->result are
+                # the real signal; bash->bash ladders are not.
+                if (src.event_type == "action" and dst.event_type == "action"):
+                    continue
                 conf = float(edge.get("confidence", 0.5))
                 conf = max(0.0, min(1.0, conf))
+                if conf < 0.8:
+                    continue  # weak/hallucinated links are noise, not memory
                 mech = edge.get("mechanism") or None
                 self.add_causal_relation(
                     source_id=src.id,
