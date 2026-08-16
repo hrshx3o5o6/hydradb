@@ -146,30 +146,10 @@ PAGE = """<!doctype html>
   .live.off .dot { background:var(--faint); animation:none; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
 
-  #view { flex:1; position:relative; overflow:hidden; background:var(--bg); }
-  svg { width:100%; height:100%; display:block; cursor:grab; touch-action:none; }
-  svg.panning { cursor:grabbing; }
-
-  .edge { stroke:var(--faint); stroke-width:1; opacity:.5; transition:opacity .2s; }
-  .edge.edge-CAUSES { stroke:var(--accent); stroke-width:1.4; opacity:.85; }
-  .edge.edge-ENABLES { stroke:var(--faint); stroke-width:1; }
-  .edge.edge-OVERWRITES { stroke:var(--faint); stroke-width:1; stroke-dasharray:5 4; }
-  .edge.edge-CONFLICTS { stroke:var(--accent-dim); stroke-width:1;
-                         stroke-dasharray:2 5; opacity:.7; }
-  .edge.new { animation:drawIn .7s ease-out both; }
-  @keyframes drawIn { from { opacity:0; stroke-width:3 } to { opacity:.85;
-    stroke-width:inherit } }
-  .edge:hover { opacity:1; stroke-width:2; }
-
-  .node { cursor:move; }
-  .node circle { fill:var(--bg2); stroke:var(--faint); stroke-width:1.4; }
-  .node:hover circle { fill:var(--accent); stroke:var(--accent); }
-  .node .lab { fill:var(--dim); font-size:8px; letter-spacing:.05em;
-               text-anchor:middle; }
-  .node:hover .lab { fill:var(--ink); }
-  .node.new { animation:popIn .5s ease-out both; }
-  .node.new circle { stroke:var(--accent); fill:#26100A; }
-  @keyframes popIn { from { opacity:0 } to { opacity:1 } }
+  #view { flex:1; position:relative; overflow:hidden; background:var(--bg);
+          cursor:grab; touch-action:none; }
+  #view.orbs { cursor:grabbing; }
+  #cv { width:100%; height:100%; display:block; position:relative; z-index:1; }
 
   #tooltip { position:absolute; display:none; z-index:20; pointer-events:none;
              max-width:360px; background:#16171B; border:1px solid var(--line);
@@ -201,7 +181,7 @@ PAGE = """<!doctype html>
   </div>
   <div class="live" id="live"><span class="dot"></span>LIVE</div>
 </header>
-<div id="view"><svg id="svg"></svg></div>
+<div id="view"><canvas id="cv"></canvas></div>
 <div id="tooltip"></div>
 <footer>
   <span>HYDRADB</span><span class="ok">●</span>
@@ -209,177 +189,287 @@ PAGE = """<!doctype html>
 </footer>
 <script>
 (function(){
-  const NS = "http://www.w3.org/2000/svg";
-  const svg = document.getElementById("svg");
+  const cv = document.getElementById("cv");
   const view = document.getElementById("view");
-  const W = () => svg.clientWidth || 900, H = () => svg.clientHeight || 700;
-  const tick = { nodes:{}, edges:{} };   // id -> our anim state
-  const textMap = {};                    // node id -> server node (label data)
+  const ctx = cv.getContext("2d");
+  const tick = { nodes:{}, edges:{} };   // id -> our state
+  const textMap = {};                    // node id -> server node
 
-  const gRoot = el("g",{class:"mains"});
-  svg.appendChild(gRoot);
-  let cam = {x:0, y:0, k:1};             // pan + zoom
-  let drag = null;
-  let fitted = false;
+  let W = 0, H = 0, DPR = 1;
+  function resize(){
+    DPR = window.devicePixelRatio || 1;
+    W = cv.clientWidth  || 900; H = cv.clientHeight || 700;
+    cv.width = W * DPR; cv.height = H * DPR;
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+  }
+  window.addEventListener("resize", resize);
+  resize();
 
-  function el(name, attrs){
-    const n = document.createElementNS(NS, name);
-    for (const k in attrs) n.setAttribute(k, attrs[k]);
-    return n;
+  // ---- camera: orbit around a target ----
+  const FOV = 60 * Math.PI / 180;
+  const cam = { yaw: 0.6, pitch: 0.5, dist: 460, tx: 0, ty: 0, tz: 0 };
+  const NEAR = 1;
+  const focal = () => (H/2) / Math.tan(FOV/2);
+
+  const C = { f:[0,0,0], r:[1,0,0], u:[0,1,0] };  // camera basis
+  function setBasis(){
+    const cp = Math.cos(cam.pitch);
+    const px = cam.tx + cam.dist * cp * Math.sin(cam.yaw);
+    const py = cam.ty + cam.dist * Math.sin(cam.pitch);
+    const pz = cam.tz + cam.dist * cp * Math.cos(cam.yaw);
+    let fx = cam.tx - px, fy = cam.ty - py, fz = cam.tz - pz;
+    const fl = Math.hypot(fx,fy,fz) || 1; fx/=fl; fy/=fl; fz/=fl;
+    // right = normalize(cross(f, up(0,1,0)))
+    let rx = fz, rz = -fx, rl = Math.hypot(rx,rz) || 1; rx/=rl; rz/=rl;
+    // up = cross(right, f)
+    const ux = rz*fy - 0*fz;   // = rz*fy
+    const uy = fz*rx - fx*rz;
+    const uz = fx*0 - rx*fy;   // = -rx*fy
+    C.f = [fx,fy,fz]; C.r = [rx,0,rz]; C.u = [ux,uy,uz];
   }
 
-  function applyCam(){
-    gRoot.setAttribute("transform",
-      "translate(" + cam.x + "," + cam.y + ") scale(" + cam.k + ")");
-    for (const l of labels) l.setAttribute("opacity", cam.k < .5 ? "0" : "1");
+  // returns {x,y,z} or null if behind camera
+  function project(p){
+    const fx=C.f[0], fy=C.f[1], fz=C.f[2];
+    const rx=C.r[0], rz=C.r[2];
+    const ux=C.u[0], uy=C.u[1], uz=C.u[2];
+    const relx = p.x - (cam.tx + cam.dist*Math.cos(cam.pitch)*Math.sin(cam.yaw));
+    const rely = p.y - (cam.ty + cam.dist*Math.sin(cam.pitch));
+    const relz = p.z - (cam.tz + cam.dist*Math.cos(cam.pitch)*Math.cos(cam.yaw));
+    const depth = relx*fx + rely*fy + relz*fz;
+    if (depth < NEAR) return null;
+    const sx = relx*rx + relz*rz;
+    const sy = relx*ux + rely*uy + relz*uz;
+    const f = focal();
+    return { x: W/2 + sx*f/depth, y: H/2 - sy*f/depth, z: depth, s: f/depth };
   }
 
-  function fitAll(){
-    const ids = Object.keys(tick.nodes);
-    if (ids.length < 2) return;
-    let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
-    for (const id of ids){
-      const n = tick.nodes[id];
-      if (n.x<x0)x0=n.x; if (n.x>x1)x1=n.x;
-      if (n.y<y0)y0=n.y; if (n.y>y1)y1=n.y;
-    }
-    const w = (x1-x0)||1, h = (y1-y0)||1;
-    cam.k = Math.max(.2, Math.min(1.5, Math.min(W()/w, H()/h)*.85));
-    cam.x = W()/2 - (x0+x1)/2*cam.k;
-    cam.y = H()/2 - (y0+y1)/2*cam.k;
-    applyCam();
-  }
-
-  view.addEventListener("wheel", (ev)=>{
-    ev.preventDefault();
-    const rect = svg.getBoundingClientRect();
-    const px = ev.clientX-rect.left, py = ev.clientY-rect.top;
-    const k2 = cam.k * Math.exp(-ev.deltaY * .0012);
-    cam.k = Math.max(.1, Math.min(8, k2));
-    cam.x = px - (px - cam.x) * (cam.k / (cam.k*Math.exp(-ev.deltaY*.0012)));
-    cam.y = py - (py - cam.y) * (cam.k / (cam.k*Math.exp(-ev.deltaY*.0012)));
-    applyCam();
-  }, {passive:false});
-
-  view.addEventListener("mousedown", (ev)=>{
-    const node = ev.target.closest ? ev.target.closest(".node") : null;
-    if (node && node.__id != null){
-      drag = {mode:"node", id:node.__id, sx:ev.clientX, sy:ev.clientY,
-              ox:tick.nodes[node.__id].x, oy:tick.nodes[node.__id].y};
-      ev.preventDefault();
-    } else {
-      drag = {mode:"pan", sx:ev.clientX, sy:ev.clientY, ox:cam.x, oy:cam.y};
-      svg.classList.add("panning");
-      ev.preventDefault();
-    }
-  });
-  window.addEventListener("mousemove", (ev)=>{
-    if (!drag) return;
-    const dx = ev.clientX - drag.sx, dy = ev.clientY - drag.sy;
-    if (drag.mode === "pan"){
-      cam.x = drag.ox + dx; cam.y = drag.oy + dy;
-      applyCam();
-    } else {
-      const n = tick.nodes[drag.id];
-      if (n){
-        n.x = drag.ox + dx/cam.k; n.y = drag.oy + dy/cam.k;
-        n.vx = 0; n.vy = 0;
-        n._n.setAttribute("transform","translate("+n.x+","+n.y+")");
-        for (const e of Object.values(tick.edges)){
-          if (e.source!==drag.id && e.target!==drag.id) continue;
-          const a = tick.nodes[e.source], b = tick.nodes[e.target];
-          if (!a || !b) continue;
-          e._n.setAttribute("x1",a.x); e._n.setAttribute("y1",a.y);
-          e._n.setAttribute("x2",b.x); e._n.setAttribute("y2",b.y);
-        }
-      }
-    }
-  });
-  window.addEventListener("mouseup", ()=>{
-    drag = null; svg.classList.remove("panning");
-  });
-
-  // static sunflower layout: nodes are placed once and never moved again.
+  // ---- static 3D layout: golden-angle spiral, outward with index ----
   let placed = 0;
-  const labels = [];
-  const GOLDEN = 2.39996323;      // golden angle (radians)
+  const GOLDEN = 2.39996323;
   function layoutPos(){
     const i = placed++;
-    const rad = 30 * Math.sqrt(i);
-    return { x: W()/2 + rad*Math.cos(i*GOLDEN),
-             y: H()/2 + rad*Math.sin(i*GOLDEN) };
+    const R = 52 + 14 * Math.sqrt(i);
+    const z = 1 - 2 * ((i * 0.618034) % 1);
+    const a = i * GOLDEN;
+    const rr = R * Math.sqrt(1 - z*z);
+    return { x: rr * Math.cos(a), y: R * z * 0.9, z: rr * Math.sin(a) };
   }
 
-  function render(data){
-    const nodes = data.nodes, edges = data.edges;
-    document.getElementById("stats").textContent =
-      nodes.length + " events · " + edges.length + " causal edges";
+  // ---- render state ----
+  let hover = null, sel = null, drag = null, fitted = false;
+  const EDGE_STYLE = {
+    CAUSES:      { color:"#FF5719", width:1.6, dash:[] },
+    ENABLES:     { color:"#56585F", width:1,   dash:[] },
+    OVERWRITES:  { color:"#56585F", width:1,   dash:[5,4] },
+    CONFLICTS:   { color:"#B03F12", width:1,   dash:[2,5] },
+  };
+  const ORANGE = "#FF5719", DIM = "#8A8C93", FAINT = "#56585F";
 
-    for (const n of nodes){
-      if (!tick.nodes[n.id]){
-        const p = layoutPos();
-        tick.nodes[n.id] = {
-          id:n.id, x:p.x, y:p.y, vx:0, vy:0,
-          _n: el("g",{class:"node new"}),
-        };
-      }
-    }
-    for (const e of edges){
-      if (!tick.edges[e.source+"|"+e.target+"|"+e.type]){
-        tick.edges[e.source+"|"+e.target+"|"+e.type] = {
-          source:e.source, target:e.target, type:e.type,
-          _n: el("line",{class:"edge edge-"+e.type+" new", x1:0, y1:0, x2:0, y2:0}),
-        };
-      }
-    }
+  function render(){
+    ctx.clearRect(0,0,W,H);
+    setBasis();
 
+    // edges, far-to-near by midpoint
+    const now = performance.now();
+    const eList = [];
     for (const e of Object.values(tick.edges)){
       const a = tick.nodes[e.source], b = tick.nodes[e.target];
       if (!a || !b) continue;
-      e._n.setAttribute("x1", a.x); e._n.setAttribute("y1", a.y);
-      e._n.setAttribute("x2", b.x); e._n.setAttribute("y2", b.y);
-      if (!e._n.parentNode) gRoot.appendChild(e._n);
+      const pa = project(a), pb = project(b);
+      if (!pa || !pb) continue;
+      eList.push({e, pa, pb, mid:(pa.z+pb.z)/2});
     }
+    eList.sort((x,y)=>y.mid-x.mid);
+    for (const it of eList){
+      const st = EDGE_STYLE[it.e.type] || EDGE_STYLE.ENABLES;
+      const age = (now - it.e.bornAt) / 1000;
+      const alpha = Math.min(1, age / 0.5);
+      ctx.beginPath();
+      ctx.moveTo(it.pa.x, it.pa.y);
+      ctx.lineTo(it.pb.x, it.pb.y);
+      ctx.strokeStyle = st.color;
+      ctx.globalAlpha = alpha * (it.e.type === "CAUSES" ? 0.9 : 0.6);
+      ctx.lineWidth = st.width * Math.min(2, (it.pa.s + it.pb.s)/2);
+      ctx.setLineDash(st.dash);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+    }
+
+    // nodes, far-to-near
+    const nList = [];
+    for (const id of Object.keys(tick.nodes)){
+      const n = tick.nodes[id];
+      const p = project(n);
+      if (!p) continue;
+      nList.push({n, p});
+    }
+    nList.sort((x,y)=>y.p.z-x.p.z);
+
+    for (const it of nList){
+      const n = it.n, p = it.p;
+      const r = Math.max(1.6, Math.min(9, 7 * p.s / 20));
+      const isSel = sel === n.id, isHov = hover === n.id;
+      const born = (now - n.bornAt) / 1000;
+      // connection highlight
+      let conn = false;
+      if (sel != null){
+        for (const e of Object.values(tick.edges)){
+          if (e.source === sel && e.target === n.id ||
+              e.target === sel && e.source === n.id){ conn = true; break; }
+        }
+      }
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, 6.2832);
+      ctx.fillStyle = isSel ? ORANGE : (isHov ? "#2A1E14" : "#22242A");
+      ctx.strokeStyle = isSel || isHov ? ORANGE : (conn ? ORANGE : FAINT);
+      ctx.lineWidth = isSel ? 2 : (isHov ? 1.8 : 1.2);
+      ctx.globalAlpha = (born < 2) ? 1 : 1;
+      ctx.fill(); ctx.stroke();
+      if (born < 2){
+        // new-node ring fading out
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, r + 3, 0, 6.2832);
+        ctx.strokeStyle = ORANGE;
+        ctx.lineWidth = 1.4;
+        ctx.globalAlpha = Math.max(0, 1 - born/2);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+      if (isSel || isHov){
+        ctx.font = "9px ui-monospace,Menlo,monospace";
+        const label = shortLabel(n);
+        ctx.fillStyle = isSel ? ORANGE : DIM;
+        ctx.textAlign = "center";
+        ctx.fillText(label, p.x, p.y + r + 11);
+      }
+    }
+  }
+
+  function shortLabel(n){
+    const g = textMap[n.id];
+    const t = (g && g.text) || ("#" + n.id);
+    return t.length > 34 ? t.slice(0,34) + "…" : t;
+  }
+
+  // ---- interaction: orbit + zoom + hover/select ----
+  view.addEventListener("wheel", (ev)=>{
+    ev.preventDefault();
+    cam.dist *= Math.exp(ev.deltaY * 0.0011);
+    cam.dist = Math.max(40, Math.min(4000, cam.dist));
+  }, {passive:false});
+
+  view.addEventListener("mousedown", (ev)=>{
+    if (ev.button !== 0) return;
+    drag = { x: ev.clientX, y: ev.clientY, yaw: cam.yaw, pitch: cam.pitch };
+    view.classList.add("orbs");
+  });
+  window.addEventListener("mousemove", (ev)=>{
+    if (drag){
+      cam.yaw   = drag.yaw   - (ev.clientX - drag.x) * 0.005;
+      cam.pitch = Math.max(-1.4, Math.min(1.4,
+                   drag.pitch + (ev.clientY - drag.y) * 0.005));
+      return;
+    }
+    // hover pick
+    const rect = cv.getBoundingClientRect();
+    const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+    setBasis();
+    let best = null, bestD = 14;
+    for (const id of Object.keys(tick.nodes)){
+      const p = project(tick.nodes[id]);
+      if (!p) continue;
+      const d = Math.hypot(p.x - mx, p.y - my);
+      if (d < bestD){ bestD = d; best = id; }
+    }
+    hover = best;
+    if (hover != null){
+      const g = textMap[hover];
+      const tt = document.getElementById("tooltip");
+      if (g){
+        const head = (g.session_id || "?") + (g.type ? " · " + g.type : "") +
+          (g.topic ? " · " + g.topic : "");
+        tt.innerHTML = '<div class="tt-h">' + head + "</div>" +
+          '<div class="tt-b">' + g.text + "</div>";
+        tt.style.display = "block";
+        tt.style.left = (mx + 16) + "px";
+        tt.style.top  = (my + 16) + "px";
+      }
+    } else if (!sel){
+      document.getElementById("tooltip").style.display = "none";
+    }
+  });
+  window.addEventListener("mouseup", (ev)=>{
+    if (drag){
+      const moved = Math.hypot(ev.clientX - drag.x, ev.clientY - drag.y);
+      if (moved < 5){
+        // click = toggle selection
+        const rect = cv.getBoundingClientRect();
+        const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+        setBasis();
+        let best = null, bestD = 14;
+        for (const id of Object.keys(tick.nodes)){
+          const p = project(tick.nodes[id]);
+          if (!p) continue;
+          const d = Math.hypot(p.x - mx, p.y - my);
+          if (d < bestD){ bestD = d; best = id; }
+        }
+        sel = (best === sel) ? null : best;
+      }
+    }
+    drag = null; view.classList.remove("orbs");
+  });
+  view.addEventListener("mouseleave", ()=>{
+    if (!drag && !sel) document.getElementById("tooltip").style.display = "none";
+  });
+  view.addEventListener("dblclick", (ev)=>{
+    // refocus on the middle of the graph
+    const rect = cv.getBoundingClientRect();
+    const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+    setBasis();
+    // project target plane through origin
+    cam.tx = cam.ty = cam.tz = 0;
+    let x0=1e9,y0=1e9,z0=1e9,x1=-1e9,y1=-1e9,z1=-1e9;
     for (const n of Object.values(tick.nodes)){
-      const nn = n._n;
-      nn.setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
-      if (!nn.parentNode) gRoot.appendChild(nn);
-      nn.__id = n.id;
-      if (nn._done) continue;
-      nn._done = true;
-      nn.appendChild(el("circle", {r:8}));
-      const g0 = textMap[n.id];
-      const text = (g0 && g0.text) || ("#" + n.id);
-      const short = text.length > 30 ? text.slice(0,30) + "…" : text;
-      const t1 = el("text", {class:"lab", x:0, y:24}); t1.textContent = short;
-      nn.appendChild(t1);
-      labels.push(t1);
+      if (n.x<x0)x0=n.x; if (n.x>x1)x1=n.x;
+      if (n.y<y0)y0=n.y; if (n.y>y1)y1=n.y;
+      if (n.z<z0)z0=n.z; if (n.z>z1)z1=n.z;
+    }
+    if (x1 < 1e8){
+      cam.tx = (x0+x1)/2; cam.ty = (y0+y1)/2; cam.tz = (z0+z1)/2;
+      cam.dist = Math.hypot(x1-x0, y1-y0, z1-z0) * 1.6 + 60;
+    }
+  });
+
+  function fitAll(){
+    let rMax = 10;
+    for (const n of Object.values(tick.nodes)){
+      rMax = Math.max(rMax, Math.hypot(n.x, n.y, n.z));
+    }
+    cam.dist = Math.max(60, rMax * 2.1);
+  }
+
+  // ---- data ingest ----
+  function renderData(data){
+    document.getElementById("stats").textContent =
+      data.nodes.length + " events · " + data.edges.length + " causal edges";
+    const now = performance.now();
+    for (const n of data.nodes){
+      if (!tick.nodes[n.id]){
+        const p = layoutPos();
+        tick.nodes[n.id] = { id:n.id, x:p.x, y:p.y, z:p.z, bornAt:now };
+      }
+    }
+    for (const e of data.edges){
+      const k = e.source + "|" + e.target + "|" + e.type;
+      if (!tick.edges[k]){
+        tick.edges[k] = { source:e.source, target:e.target, type:e.type, bornAt:now };
+      }
     }
     if (!fitted && Object.keys(tick.nodes).length > 1){
       fitted = true; fitAll();
     }
-  }
-
-  function wireTooltips(data){
-    const tt = document.getElementById("tooltip");
-    view.onmousemove = (ev)=>{
-      const g = document.elementFromPoint(ev.clientX, ev.clientY);
-      const gEl = g && g.closest ? g.closest(".node") : null;
-      if (!gEl){ tt.style.display = "none"; return; }
-      const id = gEl.__id;
-      if (id == null) return;
-      const n = textMap[id];
-      if (n){
-        const head = (n.session_id || "?") + (n.type ? " · " + n.type : "") +
-          (n.topic ? " · " + n.topic : "");
-        const t = '<div class="tt-h">' + head + "</div>" +
-          '<div class="tt-b">' + n.text + "</div>";
-        tt.innerHTML = t;
-        tt.style.display = "block";
-        tt.style.left = (ev.clientX + 14) + "px";
-        tt.style.top  = (ev.clientY + 14) + "px";
-      }
-    };
   }
 
   function clock(){
@@ -394,7 +484,7 @@ PAGE = """<!doctype html>
       const r = await fetch("/api/graph");
       const data = await r.json();
       for (const n of data.nodes) if (!textMap[n.id]) textMap[n.id] = n;
-      render(data); wireTooltips(data);
+      renderData(data);
       document.getElementById("live").classList.remove("off");
       document.getElementById("live").lastChild.textContent = " LIVE";
     } catch(e){
@@ -403,8 +493,11 @@ PAGE = """<!doctype html>
     }
   }
 
+  function loop(){ render(); requestAnimationFrame(loop); }
+
   clock(); setInterval(clock, 1000);
   setInterval(poll, 1000); poll();
+  requestAnimationFrame(loop);
 })();
 </script>
 </body>
