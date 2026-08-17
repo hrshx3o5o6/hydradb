@@ -24,6 +24,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
+from .tracing import recent_traces
+
 
 class CausalGraphAPI:
     """Reads the causal graph out of HydraDB (pure reads, no LLM)."""
@@ -63,7 +65,7 @@ class CausalGraphAPI:
         edges = []
         for rel_type in ("CAUSES", "ENABLES", "OVERWRITES", "CONFLICTS"):
             try:
-                edges += self.rows_to_dicts(
+                for e in self.rows_to_dicts(
                     self.query(
                         f"MATCH (a:Event)-[r:{rel_type}]->(b:Event) "
                         "RETURN a.id AS source, b.id AS target, "
@@ -71,11 +73,11 @@ class CausalGraphAPI:
                         "LIMIT 2000",
                     ),
                     ["source", "target", "confidence"],
-                )
+                ):
+                    e["type"] = rel_type
+                    edges.append(e)
             except RuntimeError:
                 continue
-        for e in edges:
-            e["type"] = rel_type
         return {"nodes": nodes, "edges": edges}
 
 
@@ -84,7 +86,7 @@ PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>HydraDB · causal memory</title>
+<title>HydraDNA · causal memory</title>
 <style>
   :root {
     --bg:#1C1D21; --bg2:#22242A; --panel:#16171B;
@@ -159,6 +161,50 @@ PAGE = """<!doctype html>
                    font-weight:700; margin-bottom:6px; text-transform:uppercase; }
   #tooltip .tt-b { color:var(--ink); line-height:1.5; }
 
+  #trace { position:absolute; top:0; right:0; bottom:0; width:280px;
+           z-index:10; background:rgba(22,23,27,.92); border-left:1px solid var(--line);
+           display:flex; flex-direction:column; font-size:10px; overflow:hidden;
+           pointer-events:none; }
+  #trace .tr-h { flex:0 0 auto; padding:10px 14px; border-bottom:1px solid var(--line);
+                 color:var(--accent); font-size:9px; letter-spacing:.2em; font-weight:700; }
+  #trace .tr-h2 { flex:0 0 auto; color:var(--dim); }
+  #trace .tr-h2 .tr-h2 { color:var(--faint); font-weight:400; }
+  #trace .tr-l { flex:1; overflow-y:auto; padding:8px 10px; }
+  #trace .tr-item { margin-bottom:10px; padding:8px 10px; background:var(--bg2);
+                    border:1px solid var(--line); border-left:2px solid var(--accent); }
+  #trace .tr-item.running { border-left-color:var(--green); }
+  #trace .tr-top { display:flex; justify-content:space-between; gap:8px;
+                   color:var(--ink); margin-bottom:6px; letter-spacing:.08em; }
+  #trace .tr-top b { color:var(--accent); font-weight:700; text-transform:uppercase; }
+  #trace .tr-top .ms { color:var(--faint); white-space:nowrap; }
+  #trace .tr-q { color:var(--dim); margin-bottom:6px; line-height:1.4; word-break:break-word; }
+  #trace .tr-s { display:flex; align-items:flex-start; gap:8px; position:relative;
+                 padding:2px 0 2px 0; color:var(--dim); line-height:1.35; }
+  #trace .tr-s::before { content:""; position:absolute; left:3px; top:14px; bottom:-4px;
+                         width:1px; background:var(--line); }
+  #trace .tr-s:last-child::before { display:none; }
+  #trace .tr-s .dot { flex:0 0 7px; height:7px; margin-top:4px; border-radius:50%;
+                      background:var(--accent); position:relative; z-index:1; }
+  #trace .tr-s.running .dot { background:var(--green); animation:pulse 1s ease-in-out infinite; }
+  #trace .tr-s .body { flex:1; min-width:0; }
+  #trace .tr-s .body .name { color:var(--ink); letter-spacing:.06em; }
+  #trace .tr-s .body .ms { color:var(--faint); margin-left:6px; }
+  #trace .tr-s .body .det { margin-top:2px; color:var(--faint); font-size:9px;
+                            word-break:break-word; }
+
+  #trace .ev-item { margin-bottom:6px; padding:6px 10px; background:var(--bg2);
+                    border:1px solid var(--line); border-left:2px solid var(--line); }
+  #trace .ev-item.user { border-left-color:var(--accent); }
+  #trace .ev-item.new { animation:evIn .5s ease-out both; }
+  @keyframes evIn { from { background:rgba(255,87,25,.18); } to { background:var(--bg2); } }
+  #trace .ev-top { display:flex; justify-content:space-between; gap:8px; margin-bottom:3px;
+                   color:var(--faint); font-size:8px; letter-spacing:.1em; }
+  #trace .ev-top b { color:var(--accent); }
+  #trace .ev-item.user .ev-top b { color:var(--ink); }
+  #trace .ev-text { color:var(--dim); font-size:9px; line-height:1.4; word-break:break-word; }
+  #trace .ev-item.user .ev-text { color:var(--ink); }
+  #trace .ev-text::before { content:"▸ "; color:var(--accent); }
+
   footer { flex:0 0 auto; display:flex; align-items:center; gap:20px;
            padding:6px 18px; background:var(--panel); border-top:1px solid var(--line);
            color:var(--faint); font-size:9px; letter-spacing:.2em;
@@ -169,7 +215,7 @@ PAGE = """<!doctype html>
 <body>
 <header>
   <div class="brand cut">
-    <div class="mark">HYDRA<small>GRAPH DB</small></div>
+    <div class="mark">HYDRA<small>DNA</small></div>
   </div>
   <div class="mid">
     <h1>CAUSAL&nbsp;MEMORY</h1>
@@ -182,9 +228,15 @@ PAGE = """<!doctype html>
   <div class="live" id="live"><span class="dot"></span>LIVE</div>
 </header>
 <div id="view"><canvas id="cv"></canvas></div>
+<div id="trace">
+  <div class="tr-h">LIVE <span class="tr-h2">EVENTS</span></div>
+  <div class="tr-l" id="eventList"></div>
+  <div class="tr-h tr-h2">RETRIEVAL <span class="tr-h2">TIMELINE</span></div>
+  <div class="tr-l" id="traceList"></div>
+</div>
 <div id="tooltip"></div>
 <footer>
-  <span>HYDRADB</span><span class="ok">●</span>
+  <span>HYDRADNA</span><span class="ok">●</span>
   <span>POLL&nbsp;1S</span><span id="clock">--:--:--</span>
 </footer>
 <script>
@@ -259,7 +311,7 @@ PAGE = """<!doctype html>
   // ---- render state ----
   let hover = null, sel = null, drag = null, fitted = false;
   const EDGE_STYLE = {
-    CAUSES:      { color:"#FF5719", width:1.6, dash:[] },
+    CAUSES:      { color:"#FF7A4D", width:1.4, dash:[4,3] },
     ENABLES:     { color:"#56585F", width:1,   dash:[] },
     OVERWRITES:  { color:"#56585F", width:1,   dash:[5,4] },
     CONFLICTS:   { color:"#B03F12", width:1,   dash:[2,5] },
@@ -289,7 +341,7 @@ PAGE = """<!doctype html>
       ctx.moveTo(it.pa.x, it.pa.y);
       ctx.lineTo(it.pb.x, it.pb.y);
       ctx.strokeStyle = st.color;
-      ctx.globalAlpha = alpha * (it.e.type === "CAUSES" ? 0.9 : 0.6);
+      ctx.globalAlpha = alpha * (it.e.type === "CAUSES" ? 0.7 : 0.55);
       ctx.lineWidth = st.width * Math.min(2, (it.pa.s + it.pb.s)/2);
       ctx.setLineDash(st.dash);
       ctx.stroke();
@@ -322,7 +374,7 @@ PAGE = """<!doctype html>
       }
       ctx.beginPath();
       ctx.arc(p.x, p.y, r, 0, 6.2832);
-      ctx.fillStyle = isSel ? ORANGE : (isHov ? "#2A1E14" : "#22242A");
+      ctx.fillStyle = isSel ? ORANGE : (isHov ? "#2A1E14" : "#2C2E35");
       ctx.strokeStyle = isSel || isHov ? ORANGE : (conn ? ORANGE : FAINT);
       ctx.lineWidth = isSel ? 2 : (isHov ? 1.8 : 1.2);
       ctx.globalAlpha = (born < 2) ? 1 : 1;
@@ -479,6 +531,77 @@ PAGE = """<!doctype html>
       p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
   }
 
+  const fmtTime = (ms) => {
+    const d = new Date(ms);
+    const p = (x)=>String(x).padStart(2,"0");
+    return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  };
+
+  let lastTraceId = null;
+  async function pollActivity(){
+    let traces;
+    try {
+      const r = await fetch("/api/activity");
+      traces = await r.json();
+    } catch(e){ return; }
+    if (!traces.length) return;
+    const list = document.getElementById("traceList");
+    const fresh = traces[0];
+    if (lastTraceId === fresh.id) return;
+    lastTraceId = fresh.id;
+    let html = "";
+    for (const tr of traces.slice(0, 6)){
+      const st = tr.stages || [];
+      html += '<div class="tr-item"><div class="tr-top"><b>' + tr.tool +
+        '</b><span class="ms">' + fmtTime(tr.start) + ' · ' + tr.total_ms + 'ms</span></div>';
+      if (tr.query){
+        let q = tr.query;
+        try { const obj = JSON.parse(q); q = obj.query || obj.text || obj.question || q; }
+        catch(e){}
+        html += '<div class="tr-q">' + q + '</div>';
+      }
+      for (const s of st){
+        html += '<div class="tr-s"><span class="dot"></span><span class="body">' +
+          '<span class="name">' + s.name + '</span><span class="ms">' + s.ms + 'ms</span>' +
+          (s.detail ? '<div class="det">' + s.detail + '</div>' : '') +
+          '</span></div>';
+      }
+      if (tr.result){
+        html += '<div class="tr-q" style="margin-top:6px;color:var(--green)">→ ' +
+          esc(tr.result) + '</div>';
+      }
+      html += '</div>';
+    }
+    list.innerHTML = html;
+  }
+
+  function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
+  let lastEventId = null;
+  async function pollEvents(){
+    let evs;
+    try {
+      const r = await fetch("/api/events");
+      evs = await r.json();
+    } catch(e){ return; }
+    if (!evs.length) return;
+    const fresh = evs[0];
+    if (lastEventId === fresh.id) return;
+    lastEventId = fresh.id;
+    const list = document.getElementById("eventList");
+    let html = "";
+    for (const ev of evs.slice(0, 14)){
+      const isUser = ev.type === "user";
+      const cls = isUser ? "ev-item user" : "ev-item";
+      const t = ev.timestamp ? fmtTime(ev.timestamp * 1000) : "--:--:--";
+      const txt = isUser ? (ev.text || "").slice(0, 140) : (ev.text || "").slice(0, 90);
+      html += '<div class="' + cls + '"><div class="ev-top"><b>' +
+        (isUser ? "YOU" : (ev.type || "event")) + '</b><span>' + t + '</span></div>' +
+        '<div class="ev-text">' + esc(txt) + '</div></div>';
+    }
+    list.innerHTML = html;
+  }
+
   async function poll(){
     try {
       const r = await fetch("/api/graph");
@@ -497,6 +620,8 @@ PAGE = """<!doctype html>
 
   clock(); setInterval(clock, 1000);
   setInterval(poll, 1000); poll();
+  setInterval(pollActivity, 800); pollActivity();
+  setInterval(pollEvents, 1000); pollEvents();
   requestAnimationFrame(loop);
 })();
 </script>
@@ -519,6 +644,23 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 g = self.api.graph()
                 self._send(200, json.dumps(g).encode())
+            except Exception as e:
+                self._send(500, json.dumps({"error": str(e)}).encode())
+        elif self.path == "/api/activity":
+            try:
+                self._send(200, json.dumps(recent_traces()).encode())
+            except Exception as e:
+                self._send(500, json.dumps({"error": str(e)}).encode())
+        elif self.path == "/api/events":
+            try:
+                rows = self.api.query(
+                    "MATCH (e:Event) "
+                    "RETURN e.id, e.text, e.timestamp, e.type, e.topic "
+                    "ORDER BY e.timestamp DESC LIMIT 60"
+                )
+                evs = [dict(zip(["id", "text", "timestamp", "type", "topic"],
+                                (c.get("value") for c in row))) for row in rows]
+                self._send(200, json.dumps(evs).encode())
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}).encode())
         else:

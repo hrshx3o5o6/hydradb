@@ -39,6 +39,7 @@ from mcp.types import (
 )
 
 from .memory import CausalMemory
+from .tracing import Trace
 
 
 async def _on_list_tools(
@@ -252,6 +253,12 @@ async def list_tools() -> list[types.Tool]:
 
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
     mem = _mem()
+    trace = Trace(name, json.dumps(arguments)[:160])
+
+    def done(result_text: str = "") -> list[types.TextContent]:
+        trace.result = result_text[:200]
+        trace.emit()
+        return [types.TextContent(type="text", text=result_text)]
 
     if name == "observe":
         t = arguments.get("timestamp")
@@ -261,14 +268,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             topic=arguments.get("topic"),
             timestamp=t,
         )
-        return [types.TextContent(type="text", text=f"event id={e.id} stored")]
+        return done(f"event id={e.id} stored")
     if name == "recent_events":
         events = mem._recent_events(limit=arguments.get("limit", 20))
-        return [types.TextContent(type="text", text=json.dumps([_event_json(e) for e in events]))]
+        return done(json.dumps([_event_json(e) for e in events]))
     if name == "propose_edges_window":
         pairs, _offset = _candidate_pairs(mem, arguments.get("window_events", 30),
                                           arguments.get("max_candidates", 60))
-        return [types.TextContent(type="text", text=json.dumps(pairs))]
+        return done(json.dumps(pairs))
     if name == "link":
         r = mem.add_causal_relation(
             source_id=arguments["source_id"],
@@ -277,41 +284,38 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             confidence=float(arguments.get("confidence", 1.0)),
             mechanism=arguments.get("mechanism"),
         )
-        return [types.TextContent(type="text",
-                                  text=f"linked {r.source_id} CAUSES {r.target_id} (conf {r.confidence})")]
+        return done(f"linked {r.source_id} CAUSES {r.target_id} (conf {r.confidence})")
     if name == "search":
         events = mem.search(arguments["text"], limit=arguments.get("limit", 10))
-        return [types.TextContent(type="text", text=json.dumps([_event_json(e) for e in events]))]
+        return done(json.dumps([_event_json(e) for e in events]))
     if name == "get_event":
-        return [types.TextContent(type="text",
-                                  text=json.dumps(_event_json(mem.get_event(arguments["event_id"]))))]
+        return done(json.dumps(_event_json(mem.get_event(arguments["event_id"]))))
     if name == "find_causes":
         paths = mem.find_causes(arguments["event_id"], max_hops=arguments.get("max_hops", 3))
-        return [types.TextContent(type="text", text=json.dumps([_path_json(p) for p in paths]))]
+        return done(json.dumps([_path_json(p) for p in paths]))
     if name == "find_effects":
         paths = mem.find_all_effects(arguments["event_id"], max_hops=arguments.get("max_hops", 3))
-        return [types.TextContent(type="text", text=json.dumps([_path_json(p) for p in paths]))]
+        return done(json.dumps([_path_json(p) for p in paths]))
     if name == "causal_path":
         paths = mem.find_causal_path(
             source_id=arguments["source_id"],
             target_id=arguments["target_id"],
             max_hops=arguments.get("max_hops", 5),
         )
-        return [types.TextContent(type="text", text=json.dumps([_path_json(p) for p in paths]))]
+        return done(json.dumps([_path_json(p) for p in paths]))
     if name == "why":
         target_id = mem._match_event_by_keywords(arguments["question"])
         if target_id is None:
-            return [types.TextContent(type="text", text="Could not resolve question to an event.")]
+            return done("Could not resolve question to an event.")
         paths = mem.find_causes(target_id, max_hops=arguments.get("max_hops", 8))
         paths.sort(key=lambda p: -len(p.events))
-        return [types.TextContent(type="text",
-                                  text=json.dumps({"target_id": target_id,
-                                            "paths": [_path_json(p) for p in paths]}))]
+        return done(json.dumps({"target_id": target_id,
+                                "paths": [_path_json(p) for p in paths]}))
     if name == "graph_dump":
-        return [types.TextContent(type="text", text=json.dumps(_dump_json(mem)))]
+        return done(json.dumps(_dump_json(mem)))
     if name == "reset":
         mem.reset()
-        return [types.TextContent(type="text", text="store reset")]
+        return done("store reset")
     raise ValueError(f"Unknown tool: {name}")
 
 

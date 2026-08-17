@@ -18,6 +18,7 @@ from typing import Optional, List, Dict, Any
 from .client import HydraDBClient
 from .llm import LLM, LLMError, extract_json
 from .schema import Event, CausalRelation, CausalPath, hash_id
+from .tracing import Trace
 
 
 class CausalMemory:
@@ -245,14 +246,25 @@ class CausalMemory:
         The engine rejects CONTAINS in WHERE, so fetch recent events and
         filter client-side.
         """
+        trace = Trace("search", text)
+        s1 = trace.stage("fetch_events",
+                         "MATCH (e:Event) RETURN e.* ORDER BY e.timestamp DESC")
         query = (
             'MATCH (e:Event) '
             "RETURN e.id, e.text, e.timestamp, e.session_id, e.type, e.topic "
             "ORDER BY e.timestamp DESC"
         )
         events = [self._event_from_row(row) for row in self.client.execute(query)]
+        s1.detail = f"engine returned {len(events)} event row(s)"
+        s1.finish()
+        s2 = trace.stage("filter", f"client-side substring '{text}' (CONTAINS rejected by engine)")
         needle = text.lower()
-        return [e for e in events if needle in e.text.lower()][:limit]
+        hits = [e for e in events if needle in e.text.lower()][:limit]
+        s2.detail = f"{len(hits)} match(es) after substring filter"
+        s2.finish()
+        trace.result = f"{len(hits)} match(es)"
+        trace.emit()
+        return hits
 
     # --------------------------------------------------------------- helpers
 
@@ -309,14 +321,19 @@ class CausalMemory:
 
         Returns a plain-sentence answer.
         """
+        trace = Trace("why", question)
         llm = self._get_llm()
+        s1 = trace.stage("build_digest", "fetch recent events for LLM resolution")
         events = self._recent_events(limit=10000)
         event_digest = "\n".join(
             f"- id {e.id}: {e.text} (session {e.session_id}, topic {e.topic})"
             for e in events[-250:]  # newest 250 for LLM digestion
         )
+        s1.detail = f"digested {min(len(events), 250)} event(s)"
+        s1.finish()
 
         # 1. Resolve the question to a target event id.
+        s2 = trace.stage("resolve_target", "LLM maps question -> event id")
         target_json = llm.complete(
             system=(
                 "You map natural-language questions to stored event ids. "
@@ -332,20 +349,38 @@ class CausalMemory:
         except LLMError:
             target = None
         if not target:
+            s2.detail = "LLM returned null -> keyword fallback"
+            s2.finish()
+            s2b = trace.stage("keyword_fallback",
+                              "word-overlap scoring across stored events")
             target = self._match_event_by_keywords(question)
+            s2b.detail = f"resolved to event {target}" if target else "no keyword match"
+            s2b.finish()
+        else:
+            s2.detail = f"resolved to event {target}"
+            s2.finish()
 
         if not target:
+            trace.result = "no matching event"
+            trace.emit()
             return f'I don\'t have a memory entry that matches "{question}".'
 
         # 2. Pull causal ancestry.
+        s3 = trace.stage("traverse_graph",
+                         "CALL algo.SSpaths relDirection=incoming maxLen=4")
         paths = self.find_causes(int(target), max_hops=4)
+        s3.detail = f"engine returned {len(paths)} causal path(s)"
+        s3.finish()
         if not paths:
             base: Optional[Event] = self.get_event(int(target))
             label = base.text if base else str(target)
+            trace.result = "no causal chain recorded"
+            trace.emit()
             return f'No causal chain recorded yet for "{label}". ' \
                    "Log more observations and run extract_causality() to discover one."
 
         # 3. Narrate the most complete (longest) causal chain.
+        s4 = trace.stage("narrate", "LLM turns longest causal chain into prose")
         best = max(paths, key=lambda p: len(p.events))
         chain_lines = []
         for i, ev in enumerate(best.events):
@@ -355,6 +390,8 @@ class CausalMemory:
                 mech = f' — "{r.mechanism}"' if r.mechanism else ""
                 chain_lines.append(f"    <- CAUSED BY (conf {r.confidence:.2f}){mech}")
         chain_text = "\n".join(chain_lines)
+        s4.detail = f"chain of {len(best.events)} event(s), {len(best.relations)} relation(s)"
+        s4.finish()
 
         answer = llm.complete(
             system=(
@@ -365,6 +402,8 @@ class CausalMemory:
             user=f"Causal chain leading to the target event:\n{chain_text}\n\n"
                  f'Original question: "{question}"',
         )
+        trace.result = answer.strip()[:120]
+        trace.emit()
         return answer.strip()
 
     def extract_causality(self, window_events: Optional[int] = 12,

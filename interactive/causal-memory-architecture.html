@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HydraDB - Causal Memory Architecture</title>
+<style>
+  :root { --bg:#0D0E10; --bg2:#141519; --panel:#1A1B20; --ink:#F2F0EA; --dim:#8A8C93; --faint:#56585F; --accent:#FF5719; --accent-dim:#B03F12; --line:#2A2C33; --green:#4ADE80; --blue:#60A5FA; --purple:#C084FC; --cyan:#22D3EE; --yellow:#FBBF24; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--ink); font:13px/1.7 ui-monospace,"SF Mono",Menlo,Consolas,monospace; padding:40px; max-width:1100px; margin:0 auto; }
+  h1 { font-size:14px; font-weight:800; letter-spacing:.3em; color:var(--accent); margin-bottom:8px; }
+  h2 { font-size:11px; font-weight:700; letter-spacing:.24em; color:var(--ink); margin:36px 0 12px; padding-bottom:6px; border-bottom:1px solid var(--line); }
+  h3 { font-size:10px; font-weight:700; letter-spacing:.18em; color:var(--accent); margin:18px 0 8px; }
+  p,li { color:var(--dim); font-size:12px; line-height:1.7; }
+  strong { color:var(--ink); font-weight:600; }
+  .accent { color:var(--accent); } .blue { color:var(--blue); } .green { color:var(--green); } .purple { color:var(--purple); } .cyan { color:var(--cyan); } .yellow { color:var(--yellow); } .dim { color:var(--dim); } .faint { color:var(--faint); } .accent-dim { color:var(--accent-dim); }
+  .diagram { background:var(--panel); border:1px solid var(--line); padding:28px; margin:16px 0; position:relative; overflow:hidden; }
+  .diagram::before { content:""; position:absolute; inset:0; pointer-events:none; background-image:radial-gradient(rgba(255,255,255,.03) 1px,transparent 1px); background-size:18px 18px; }
+  .diagram .tag { position:absolute; top:10px; right:14px; font-size:8px; letter-spacing:.2em; color:var(--faint); text-transform:uppercase; }
+  pre { margin:0; font:12px/1.5 ui-monospace,Menlo,Consolas,monospace; position:relative; z-index:1; }
+  .cols { display:grid; grid-template-columns:1fr 1fr; gap:20px; margin:12px 0; }
+  @media (max-width:700px) { .cols { grid-template-columns:1fr; } }
+  .col-box { background:var(--bg2); border:1px solid var(--line); padding:16px; }
+  .col-box h4 { font-size:10px; font-weight:700; letter-spacing:.18em; margin-bottom:8px; }
+  .col-box ul { padding-left:14px; }
+  .col-box li { margin:3px 0; }
+</style>
+</head>
+<body>
+
+<h1>HYDRADB &mdash; CAUSAL MEMORY ARCHITECTURE</h1>
+<p style="color:var(--faint);font-size:11px;letter-spacing:.14em;margin-bottom:24px;">
+How the system works, how retrieval works, and how each piece wraps around HydraDB.
+</p>
+
+<h2>1. WHAT HYDRADB ACTUALLY IS</h2>
+<div class="diagram"><span class="tag">SYSTEM LAYER</span>
+<pre>
+<span class="accent">+======================================================================+</span>
+<span class="accent">|</span>  <strong>HydraDB</strong>                                                            <span class="accent">|</span>
+<span class="accent">|</span>  Graph database on SlateDB. Object store = durable source of truth.   <span class="accent">|</span>
+<span class="accent">|</span>  Local dir in dev. S3 in prod.                                        <span class="accent">|</span>
+<span class="accent">|</span>                                                                        <span class="accent">|</span>
+<span class="accent">|</span>  <span class="blue">+--------------------------------------------------------------+</span>    <span class="accent">|</span>
+<span class="accent">|</span>  <span class="blue">|</span>  <strong>Graph Model</strong>                                                 <span class="blue">|</span>    <span class="accent">|</span>
+<span class="accent">|</span>  <span class="blue">|</span>                                                                <span class="blue">|</span>    <span class="accent">|</span>
+<span class="accent">|</span>  <span class="blue">|</span>  <span class="purple">Nodes</span> = labeled vertices                                      <span class="blue">|</span>    <span class="accent">|</span>
+<span class="accent">|</span>  <span class="blue">|</span>    Event { id, text, session_id, type, topic, timestamp }      <span class="blue">|</span>    <span class="accent">|</span>
+<span class="accent">|</span>  <span class="blue">|</span>                                                                <span class="blue">|</span>    <span class="accent">|</span>
+<span class="accent">|</span>  <span class="blue">|</span>  <span class="accent">Edges</span> = typed, directed, weighted                             <span class="blue">|</span>    <span class="accent">|</span>
+<span class="accent">|</span>  <span class="blue">|</span>    CAUSES     <span style="color:var(--accent)">solid orange</span>    a-->b  (a caused b)              <span class="blue">|</span>    <span class="accent">|</span>
+<span class="accent">|</span>  <span class="blue">|</span>    ENABLES    <span style="color:var(--faint)">solid gray</span>     a-->b  (a enabled b)              <span class="blue">|</span>    <span class="accent">|</span>
+<span class="accent">|</span>  <span class="blue">|</span>    OVERWRITES <span style="color:var(--faint)">dashed gray</span>    a-->b  (a supersedes b)            <span class="blue">|</span>    <span class="accent">|</span>
+<span class="accent">|</span>  <span class="blue">|</span>    CONFLICTS  <span style="color:var(--accent-dim)">dotted dim</span>     a-->b  (a contradicts b)          <span class="blue">|</span>    <span class="accent">|</span>
+<span class="accent">|</span>  <span class="blue">|</span>                                                                <span class="blue">|</span>    <span class="accent">|</span>
+<span class="accent">|</span>  <span class="blue">|</span>  Every edge carries: <span class="accent">confidence</span> (0-1) + <span class="accent">mechanism</span> (why)          <span class="blue">|</span>    <span class="accent">|</span>
+<span class="accent">|</span>  <span class="blue">+--------------------------------------------------------------+</span>    <span class="accent">|</span>
+<span class="accent">|</span>                                                                        <span class="accent">|</span>
+<span class="accent">|</span>  <strong>Query language:</strong> OpenCypher over Bolt (port 17687) and HTTP (8443)    <span class="accent">|</span>
+<span class="accent">|</span>  <strong>One writer, many readers.</strong> WAL durability. Compaction.               <span class="accent">|</span>
+<span class="accent">|</span>  <strong>CSC indexes</strong> derived in background, never written back.             <span class="accent">|</span>
+<span class="accent">+======================================================================+</span>
+</pre>
+</div>
+
+<h2>2. WHAT WE BUILT &mdash; THE FULL STACK</h2>
+<div class="diagram"><span class="tag">ARCHITECTURE</span>
+<pre>
+<span class="purple">+-- OPENCODE -----------------------------------------------------------+</span>
+<span class="purple">|</span>                                                                       <span class="purple">|</span>
+<span class="purple">|</span>  <strong>Self-Writing Plugin</strong>                                              <span class="purple">|</span>
+<span class="purple">|</span>  <span style="color:var(--cyan)">plugin.js</span> -- hooks chat.message, tool.execute.after               <span class="purple">|</span>
+<span class="purple">|</span>  Every user message + every tool action --> <span class="purple">Event node</span>                <span class="purple">|</span>
+<span class="purple">|</span>  ID = FNV-1a hash of (session + text + timestamp)                    <span class="purple">|</span>
+<span class="purple">|</span>  Writes directly to HydraDB via the MCP client.                      <span class="purple">|</span>
+<span class="purple">|</span>  <span class="dim">User does nothing. Memory writes itself.</span>                            <span class="purple">|</span>
+<span class="purple">|</span>                                                                       <span class="purple">|</span>
+<span class="purple">|</span>  +-----------------------------------------------------------------+   <span class="purple">|</span>
+<span class="purple">|</span>  |  <strong>Agent working memory</strong> = graph traversal, not flat context    |   <span class="purple">|</span>
+<span class="purple">|</span>  +-----------------------------------------------------------------+   <span class="purple">|</span>
+<span class="purple">|</span>           |                                                             <span class="purple">|</span>
+<span class="purple">|</span>           v  <span class="dim">(via MCP protocol)</span>                                        <span class="purple">|</span>
+<span class="purple">|</span>                                                                       <span class="purple">|</span>
+<span class="purple">|</span>  <span class="purple">+-- MCP SERVER ---------------------------------------------------+</span>   <span class="purple">|</span>
+<span class="purple">|</span>  <span class="purple">|</span>  <span style="color:var(--cyan)">causal_memory/mcp_server.py</span>                                   <span class="purple">|</span>   <span class="purple">|</span>
+<span class="purple">|</span>  <span class="purple">|</span>                                                                <span class="purple">|</span>   <span class="purple">|</span>
+<span class="purple">|</span>  <span class="purple">|</span>  <span class="green">propose_edges_window</span>(window) --> LLM proposes edges          <span class="purple">|</span>   <span class="purple">|</span>
+<span class="purple">|</span>  <span class="purple">|</span>  <span class="blue">link</span>(src, dst, type, mech)   --> host reasons, writes        <span class="purple">|</span>   <span class="purple">|</span>
+<span class="purple">|</span>  <span class="purple">|</span>  <span class="accent">why</span>(question)                  --> ancestors as path          <span class="purple">|</span>   <span class="purple">|</span>
+<span class="purple">|</span>  <span class="purple">|</span>  <span class="yellow">search</span>(query)                   --> text match on nodes       <span class="purple">|</span>   <span class="purple">|</span>
+<span class="purple">|</span>  <span class="purple">|</span>  <span class="purple">find_causes</span>(event_id)            --> causal ancestry          <span class="purple">|</span>   <span class="purple">|</span>
+<span class="purple">|</span>  <span class="purple">|</span>  <span class="purple">find_effects</span>(event_id)           --> causal descendants       <span class="purple">|</span>   <span class="purple">|</span>
+<span class="purple">|</span>  <span class="purple">|</span>                                                                <span class="purple">|</span>   <span class="purple">|</span>
+<span class="purple">|</span>  <span class="purple">|</span>  <span class="dim">Pure graph ops. Zero LLM inside. The model reasons.</span>        <span class="purple">|</span>   <span class="purple">|</span>
+<span class="purple">|</span>  <span class="purple">+----------------------------------------------------------------+</span>   <span class="purple">|</span>
+<span class="purple">|</span>           |                                                             <span class="purple">|</span>
+<span class="purple">|</span>           v  <span class="dim">(OpenCypher over HTTP :8443)</span>                               <span class="purple">|</span>
+<span class="purple">+---------------------------------------------------------------------------+</span>
+                              |
+                              v
+<span class="accent">+-- HYDRADB ---------------------------------------------------------------+</span>
+<span class="accent">|</span>                                                                           <span class="accent">|</span>
+<span class="accent">|</span>  Event nodes <--- CAUSES ---> Event nodes                                 <span class="accent">|</span>
+<span class="accent">|</span>                                                                           <span class="accent">|</span>
+<span class="accent">|</span>  All nodes, edges, traversal paths stored here.                          <span class="accent">|</span>
+<span class="accent">|</span>  <span class="dim">One writer (MCP). N readers (viewer, daemon, agent).</span>                    <span class="accent">|</span>
+<span class="accent">|</span>  Object store durable. Local SSD + memory as cache.                      <span class="accent">|</span>
+<span class="accent">+---------------------------------------------------------------------------+</span>
+                              |
+                  +-----------+-----------+
+                  v                       v
+<span class="cyan">+-- EDGE DISCOVERY ----------+</span>  <span class="blue">+-- 3D GRAPH VIEWER ------------+</span>
+<span class="cyan">|</span>  <span style="color:var(--cyan)">edge_discovery.py</span>         <span class="cyan">|</span>  <span class="blue">|</span>  <span style="color:var(--blue)">graph_view.py</span> :8080           <span class="blue">|</span>
+<span class="cyan">|</span>  daemon (every 5s poll)     <span class="cyan">|</span>  <span class="blue">|</span>  Canvas 3D + orbit camera     <span class="blue">|</span>
+<span class="cyan">|</span>  new events? --> LLM find  <span class="cyan">|</span>  <span class="blue">|</span>  Edges as colored lines       <span class="blue">|</span>
+<span class="cyan">|</span>  edges --> MERGE write     <span class="cyan">|</span>  <span class="blue">|</span>  Nodes as depth-sorted dots   <span class="blue">|</span>
+<span class="cyan">|</span>  no new --> idle (no cost) <span class="cyan">|</span>  <span class="blue">|</span>  Hover=tooltip  Click=select   <span class="blue">|</span>
+<span class="cyan">+---------------------------+</span>  <span class="blue">+--------------------------------+</span>
+</pre>
+</div>
+
+<h2>3. HOW RETRIEVAL WORKS &mdash; THE TWO PATHS</h2>
+<div class="diagram"><span class="tag">RETRIEVAL</span>
+<pre>
+<span class="yellow">QUERY</span>  "Why did this bug happen?"
+  |
+  +--- <span class="accent">Path A: WHY (graph traversal)</span>
+  |
+  |    MCP <span class="accent">why("bug in auth")</span>
+  |         |
+  |         +-- <span class="yellow">search</span> --> find matching Event node(s) by text
+  |         |    Cypher: MATCH (n:Event)
+  |         |            WHERE n.text CONTAINS 'auth'
+  |         |            RETURN n LIMIT 5
+  |         |
+  |         +-- <span class="purple">find_causes</span>(event_id) --> walk CAUSES edges backwards
+  |         |    Cypher: MATCH path = (n:Event)-[:CAUSES*1..8]->(a:Event)
+  |         |            WHERE n.id = event_id
+  |         |            RETURN a, relationship, nodes(path)
+  |         |
+  |         +-- <span class="green">compose answer</span> from traversal path
+  |              "The auth bug was caused by [root cause event]
+  |               which led to [intermediate event] which led to
+  |               [symptom event]."
+  |
+  |    Retrieval is <strong>structural</strong>: walks real stored edges.
+  |    No semantic search on retrieval -- the graph IS the structure.
+  |    Path = explicit causal chain, not nearest-neighbor embeddings.
+  |
+  +--- <span class="blue">Path B: SEARCH (text match)</span>
+  |
+       MCP <span class="yellow">search("database schema")</span>
+            |
+            +-- Cypher: MATCH (n:Event)
+            |           WHERE n.text CONTAINS 'schema'
+            |           RETURN n, n.timestamp
+            |           ORDER BY n.timestamp DESC LIMIT 10
+            |
+            +-- Returns <strong>nodes, not paths</strong>.
+            |   Useful as a starting point for why/find_causes.
+            |
+            +-- Combines with Path A:
+                1. search("what changed in memory.py")  -->  find node
+                2. find_causes(node_id)                 -->  walk ancestors
+                3. Agent reads the chain + composes answer
+</pre>
+</div>
+
+<h2>4. THE WRITE PATH &mdash; HOW EDGES GET CREATED</h2>
+<div class="diagram"><span class="tag">WRITES</span>
+<pre>
+<span class="cyan">HOW CAUSAL EDGES ENTER THE GRAPH</span>
+<span class="dim">Two paths, both end with HydraDB MERGE (idempotent, safe re-run).</span>
+
+  <span class="accent">+--- Manual (host-reasoned) -------------------------------------------------</span>
+  |                                                                              |
+  |  1. Agent (or human) reads recent events via <span class="yellow">search</span>                        |
+  |  2. Agent <span class="green">reasons</span> about which events are causally linked                   |
+  |  3. Agent calls <span class="blue">link</span>(src_id, dst_id, CAUSES, mechanism="because...")       |
+  |  4. MCP server writes: MERGE (a)-[r:CAUSES]->(b) SET r.confidence, r.mech  |
+  |                                                                              |
+  |  <span class="dim">Used during: agent-directed memory curation, A/B testing</span>                 |
+  <span class="accent">+------------------------------------------------------------------------------</span>
+
+  <span class="cyan">+--- Automatic (edge discovery daemon) -----------------------------------------</span>
+  |                                                                              |
+  |  1. <span style="color:var(--cyan)">edge_discovery.py</span> polls HydraDB every 5s for new event count            |
+  |  2. When new events arrive:                                                  |
+  |     a. Fetch last 30 events (temporal window)                               |
+  |     b. Dedup identical-text events (filter noise)                           |
+  |     c. Feed window to LLM with causal-discovery prompt                      |
+  |     d. LLM returns edges with: source_idx, target_idx, confidence, why     |
+  |     e. Post-filter: confidence >= 0.8, reject tool-->tool action chains     |
+  |     f. <span class="blue">link</span>() --> MERGE each edge into HydraDB                            |
+  |  3. If no new events --> idle, zero LLM cost                                |
+  |                                                                              |
+  |  <span class="dim">Runs continuously. Edges appear automatically as sessions proceed.</span>         |
+  <span class="cyan">+------------------------------------------------------------------------------+</span>
+
+<span class="yellow">WHY MERGE (not CREATE)?</span>
+  Re-running discovery over overlapping windows is safe.
+  Same (src, dst, type) --> same edge, confidence/mechanism updated.
+  No duplicate edges ever.
+</pre>
+</div>
+
+<h2>5. WHAT MAKES THIS DIFFERENT</h2>
+<div class="cols">
+  <div class="col-box">
+    <h4 class="accent">FLAT CONTEXT (status quo)</h4>
+    <ul>
+      <li>Agent gets <strong>all history as text</strong> in a list</li>
+      <li>Oldest events buried under new ones</li>
+      <li>No structure -- everything is "nearby text"</li>
+      <li>Retrieval = nearest-neighbor in embedding space</li>
+      <li>Scaling: linearly growing context window</li>
+      <li>Why = "the embeddings were similar"</li>
+    </ul>
+  </div>
+  <div class="col-box">
+    <h4 class="green">CAUSAL MEMORY (what we built)</h4>
+    <ul>
+      <li>Agent gets <strong>structured traversal paths</strong></li>
+      <li>Causal chain: root cause --> intermediate --> symptom</li>
+      <li>Structure = explicit typed, weighted edges</li>
+      <li>Retrieval = walk real edges in the graph</li>
+      <li>Scaling: graph grows, traversal stays bounded (1..8 hops)</li>
+      <li>Why = "here is the chain and why each link exists"</li>
+    </ul>
+  </div>
+</div>
+
+<h2>6. THE DATA MODEL AT A GLANCE</h2>
+<div class="diagram"><span class="tag">SCHEMA</span>
+<pre>
+<span class="purple">Node: Event</span>
+  id          string    FNV-1a 63-bit hash (dedup-safe)
+  text        string    The actual content (what was said/done)
+  session_id  string    Which session created it
+  type        string    "user" | "action" | "observation"
+  topic       string    Optional: topic tag
+  timestamp   int64     Unix epoch ms
+
+<span class="accent">Edge: CAUSES</span>  (directed, a --> b)
+  confidence  float     0.0 - 1.0 (LLM-judged or human-set)
+  mechanism   string    Natural-language explanation of why a caused b
+
+<span class="blue">Edge: ENABLES</span> / <span class="faint">OVERWRITES</span> / <span class="accent-dim">CONFLICTS</span>
+  (same schema, different semantics -- agent chooses the right type)
+</pre>
+</div>
+
+<h2>7. MARKETING ANGLE</h2>
+<div class="diagram"><span class="tag">PITCH</span>
+<pre>
+<span class="yellow">The problem:</span>
+  AI agents forget. Context windows are flat lists of text.
+  When something goes wrong, you get "the embeddings were similar"
+  as an explanation. No root cause. No chain of events.
+
+<span class="green">The solution:</span>
+  HydraDB causal memory gives agents a <strong>graph of what happened and why</strong>.
+  Every decision, every tool call, every outcome is a node.
+  Every causal link between them is a weighted, typed edge.
+  Retrieval = walk the chain. Answer = the actual causal path.
+
+<span class="accent">What makes it work:</span>
+  1. <strong>Self-writing</strong> -- plugin records events automatically, zero manual work
+  2. <strong>Auto-discovery</strong> -- daemon finds causal edges as they happen
+  3. <strong>Structural retrieval</strong> -- walks real edges, not similarity search
+  4. <strong>3D visualization</strong> -- see the entire causal graph in your browser
+  5. <strong>Provenance</strong> -- every edge carries "why" + confidence score
+
+<span class="cyan">One-liner:</span>
+  "Memory that remembers <em>why</em>, not just <em>what</em>."
+</pre>
+</div>
+
+</body>
+</html>
