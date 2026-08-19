@@ -126,6 +126,13 @@ class HydraDNAAdapter(BaseAdapter):
         self._cache_conv = bool(kwargs.pop("cache_conversations", False))
         self._conv_ns: str | None = None  # storage namespace of live conversation
         self._ns_to_conv: dict[str, str] = {}  # sample ns -> conv storage ns
+        # storage-ns -> document_id -> full original text. Kept so recall can
+        # hand the judge WHOLE sessions (not 700-byte slices) as context:
+        # retrieval metrics match on document_id, but qa_accuracy depends on
+        # the context text the LLM actually reads. Chunk slices were losing
+        # sentences and surrounding context, so hydradna retrieved the right
+        # session but answered worse than BM25 (which returns whole sessions).
+        self._sessions: dict[str, dict[str, str]] = {}
 
     # ------------------------------------------------------------------ lazy
 
@@ -179,10 +186,15 @@ class HydraDNAAdapter(BaseAdapter):
                 except Exception:
                     logger.warning("hydradna: dropping cached conv %s failed", self._conv_ns, exc_info=True)
                 self._docs.pop(self._conv_ns, None)
+                self._sessions.pop(self._conv_ns, None)
             self._conv_ns = conv
             namespace = conv
 
         memory = self._get_memory()
+        session_texts = self._sessions.setdefault(namespace, {})
+        for item in items:
+            if item.document_id:
+                session_texts[item.document_id] = item.content
         bucket = self._docs.setdefault(namespace, {})
         stored: list[tuple[str, int, str]] = []  # (safe_text, ts, doc_id)
         for item in items:
@@ -270,6 +282,14 @@ class HydraDNAAdapter(BaseAdapter):
                 bump(doc_id, content, float(overlap))
 
         ranked = sorted(hits.values(), key=lambda r: r.score, reverse=True)
+        # Context packaging: hand the judge WHOLE sessions, not chunk slices.
+        # hits is already keyed by document_id (one entry per session), so just
+        # swap the sliced content for the full session text.
+        session_texts = self._sessions.get(ns, {})
+        for r in ranked:
+            full = session_texts.get(r.document_id)
+            if full:
+                r.content = full
         return ranked[: query.top_k]
 
     def cleanup(self, *, namespace: str = "default") -> None:
@@ -280,6 +300,7 @@ class HydraDNAAdapter(BaseAdapter):
             self._docs.pop(namespace, None)
             return
         self._docs.pop(namespace, None)
+        self._sessions.pop(namespace, None)
         try:
             memory = self._get_memory()
             ns = namespace.replace('"', '\\"')
