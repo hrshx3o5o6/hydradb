@@ -1,0 +1,37 @@
+{
+  "n_subset": 6,
+  "total": 1986,
+  "seed": 42,
+  "selection": "proportional stratified random by question_type, largest-remainder quotas",
+  "question_type_quota": {
+    "adversarial": 1,
+    "multi_hop": 0,
+    "open_domain": 2,
+    "single_hop": 0,
+    "temporal": 3
+  },
+  "question_type_distribution": {
+    "subset": {
+      "adversarial": 1,
+      "multi_hop": 0,
+      "open_domain": 2,
+      "single_hop": 0,
+      "temporal": 3
+    },
+    "full": {
+      "multi_hop": 321,
+      "temporal": 96,
+      "single_hop": 282,
+      "open_domain": 841,
+      "adversarial": 446
+    }
+  },
+  "sample_ids": [
+    "conv-26_q107",
+    "conv-41_q65",
+    "conv-42_q87",
+    "conv-43_q15",
+    "conv-48_q206",
+    "conv-50_q39"
+  ]
+}

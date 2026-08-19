@@ -16,11 +16,14 @@ Used for:
 
 import json
 import os
+import time
 import urllib.request
 import urllib.error
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+# Overridable so bulk harnesses can fail fast instead of eating 60s timeouts.
+DEFAULT_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "60"))
 
 
 class LLMError(Exception):
@@ -40,12 +43,16 @@ class LLM:
     def complete(self, system: str, user: str, json_mode: bool = False) -> str:
         """One completion call, first healthy provider wins."""
         if self.gemini_key:
-            try:
-                return self._gemini(system, user, json_mode)
-            except Exception as e:
-                if not self.openai_key:
-                    raise LLMError(f"Gemini call failed: {e}") from e
-                # fall through to OpenAI
+            for attempt in (1, 2):
+                try:
+                    return self._gemini(system, user, json_mode)
+                except Exception as e:
+                    if attempt == 2:
+                        if not self.openai_key:
+                            raise LLMError(f"Gemini call failed: {e}") from e
+                        # fall through to OpenAI
+                    else:
+                        time.sleep(2)  # transient rate-limit / 5xx backoff
         if self.openai_key:
             return self._openai(system, user, json_mode)
         raise LLMError("All LLM providers failed.")
@@ -73,7 +80,7 @@ class LLM:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
             body = json.loads(resp.read().decode())
         parts = body["candidates"][0]["content"]["parts"]
         return "".join(p.get("text", "") for p in parts)
@@ -91,7 +98,11 @@ class LLM:
             ],
         }
         if json_mode:
-            payload["response_format"] = {"type": "json_object"}
+            # OpenAI rejects response_format json_object unless the prompt
+            # mentions "json"; fall back to plain text (extract_json tolerates
+            # un-fenced JSON) to keep the provider switch robust.
+            if "json" in (system + user).lower():
+                payload["response_format"] = {"type": "json_object"}
         req = urllib.request.Request(
             url,
             data=json.dumps(payload).encode(),
@@ -101,7 +112,7 @@ class LLM:
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
             body = json.loads(resp.read().decode())
         return body["choices"][0]["message"]["content"]
 

@@ -66,14 +66,41 @@ def _iso_to_unix(iso: str | None) -> int:
 
 
 # The HydraDB query engine rejects statements whose string literals exceed a
-# few hundred bytes (the parser errors mid-token past ~850 chars). Sessions are
-# therefore stored as a sequence of ~500-char chunk events. This mirrors how a
+# hard ~880-BYTE (UTF-8) cap; the parser errors mid-token once the literal is
+# too large. Byte budget 700 keeps unicode-heavy text (multi-byte glyphs like
+# math-italic/√/⎡ are 3-4 bytes) comfortably under the cap. This mirrors how a
 # real memory layer chunks long transcripts anyway.
-CHUNK_SIZE = 500
+CHUNK_SIZE = 700
 
 
 def _chunks(text: str, size: int = CHUNK_SIZE) -> list[str]:
-    return [text[i : i + size] for i in range(0, len(text), size)]
+    chunks: list[str] = []
+    cur = ""
+    cur_bytes = 0
+    for ch in text:
+        b = len(ch.encode("utf-8"))
+        if cur and cur_bytes + b > size:
+            chunks.append(cur)
+            cur = ""
+            cur_bytes = 0
+        cur += ch
+        cur_bytes += b
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+# Cap the event set fed to causal discovery so per-sample latency stays
+# bounded on long sessions (each LLM window call is seconds). Evenly sample
+# from the full ordered list to preserve temporal spread.
+MAX_DISCOVERY_EVENTS = 40
+
+
+def _cap_events(stored: list[tuple[str, int, str]], cap: int = MAX_DISCOVERY_EVENTS) -> list[tuple[str, int, str]]:
+    if len(stored) <= cap:
+        return stored
+    step = (len(stored) - 1) / (cap - 1)
+    return [stored[round(i * step)] for i in range(cap)]
 
 
 class HydraDNAAdapter(BaseAdapter):
@@ -90,6 +117,15 @@ class HydraDNAAdapter(BaseAdapter):
         self._llm_model = kwargs.pop("llm_model", None)
         self._memory: Any = None
         self._docs: dict[str, dict[str, tuple[str, str]]] = {}
+        # Conversation caching: LoCoMo re-ingests the SAME ~20-session
+        # conversation for every QA sample (1986 samples, 196k chunk writes
+        # naive). When enabled, samples whose document_ids share a "conv-N_"
+        # prefix store their events ONCE under a stable conversation namespace
+        # and reuse it across samples, cutting writes ~158x and keeping the
+        # node graph tiny (no delete churn -> no engine degradation).
+        self._cache_conv = bool(kwargs.pop("cache_conversations", False))
+        self._conv_ns: str | None = None  # storage namespace of live conversation
+        self._ns_to_conv: dict[str, str] = {}  # sample ns -> conv storage ns
 
     # ------------------------------------------------------------------ lazy
 
@@ -113,9 +149,39 @@ class HydraDNAAdapter(BaseAdapter):
             logger.warning("hydradna: no LLM credentials; causal discovery disabled")
             return None
 
+    def _conv_storage_ns(self, items: Sequence[IngestItem]) -> str | None:
+        """Derive a stable conversation storage namespace from document_ids.
+
+        LoCoMo document ids look like ``conv-26_session_1``; all QA samples of
+        one conversation share the same prefix, so we can store the
+        conversation once and reuse it across samples.
+        """
+        if not self._cache_conv:
+            return None
+        for item in items:
+            d = item.document_id or ""
+            m = re.match(r"^([A-Za-z0-9_-]+)_session_\d+$", d)
+            if m:
+                return "lc_" + m.group(1)
+        return None
+
     # --------------------------------------------------------------- interface
 
     def ingest(self, items: Sequence[IngestItem], *, namespace: str = "default") -> None:
+        conv = self._conv_storage_ns(items)
+        if conv:
+            self._ns_to_conv[namespace] = conv
+            if self._conv_ns == conv:
+                return  # conversation already stored; reuse it
+            if self._conv_ns is not None:
+                try:
+                    self._delete_namespace(self._get_memory(), self._conv_ns)
+                except Exception:
+                    logger.warning("hydradna: dropping cached conv %s failed", self._conv_ns, exc_info=True)
+                self._docs.pop(self._conv_ns, None)
+            self._conv_ns = conv
+            namespace = conv
+
         memory = self._get_memory()
         bucket = self._docs.setdefault(namespace, {})
         stored: list[tuple[str, int, str]] = []  # (safe_text, ts, doc_id)
@@ -143,6 +209,7 @@ class HydraDNAAdapter(BaseAdapter):
             try:
                 from causal_memory.schema import Event
 
+                sampled = _cap_events(stored)
                 events = [
                     Event(
                         id=Event.derive_id(namespace, text, ts),
@@ -152,7 +219,7 @@ class HydraDNAAdapter(BaseAdapter):
                         event_type="observation",
                         topic=item.metadata.get("session_id") if item.metadata else None,
                     )
-                    for text, ts, _doc in stored
+                    for text, ts, _doc in sampled
                 ]
                 n = memory._discover_in_window(events)
                 logger.info("hydradna: causal discovery wrote %d edge(s)", n)
@@ -163,7 +230,8 @@ class HydraDNAAdapter(BaseAdapter):
 
     def recall(self, query: RecallQuery, *, namespace: str = "default") -> list[RecallResult]:
         memory = self._get_memory()
-        bucket = self._docs.get(namespace, {})
+        ns = self._ns_to_conv.get(namespace) or namespace
+        bucket = self._docs.get(ns, {})
         hits: dict[str, RecallResult] = {}
 
         def bump(doc_id: str, content: str, score: float) -> None:
@@ -205,16 +273,56 @@ class HydraDNAAdapter(BaseAdapter):
         return ranked[: query.top_k]
 
     def cleanup(self, *, namespace: str = "default") -> None:
+        if self._cache_conv and namespace in self._ns_to_conv:
+            # Data lives in the shared conversation store; other samples of
+            # the same conversation still need it. Just release the mapping.
+            self._ns_to_conv.pop(namespace, None)
+            self._docs.pop(namespace, None)
+            return
         self._docs.pop(namespace, None)
         try:
             memory = self._get_memory()
             ns = namespace.replace('"', '\\"')
-            memory.client.execute(
-                f'MATCH (s:Session {{session_id: "{ns}"}})-[:HAS_EVENT]->(e:Event) '
-                "DETACH DELETE e, s"
-            )
+            self._delete_namespace(memory, ns)
         except Exception:
             logger.warning("hydradna: cleanup failed for %s", namespace, exc_info=True)
+
+    def _delete_namespace(self, memory: Any, ns: str) -> None:
+        """Delete a namespace's events + session anchor.
+
+        The engine's per-query deadline is 30s; on a grown graph a single
+        DETACH DELETE over the pattern can exceed it (HTTP 408/429) and the
+        leftover events accumulate into a runaway. Do a bounded pattern delete
+        first; on failure fall back to deleting events by id in small batches,
+        each op comfortably under the deadline.
+        """
+        try:
+            memory.client.execute(
+                f'MATCH (s:Session {{session_id: "{ns}"}})-[:HAS_EVENT]->(e:Event) '
+                "DETACH DELETE e, s",
+                timeout_ms=30_000,
+            )
+            return
+        except Exception:
+            logger.debug(
+                "hydradna: pattern delete failed for %s; batching by id", ns, exc_info=True
+            )
+        while True:
+            rows = memory.client.execute(
+                f'MATCH (s:Session {{session_id: "{ns}"}})-[:HAS_EVENT]->(e:Event) '
+                "RETURN e.id LIMIT 200",
+                timeout_ms=30_000,
+            )
+            ids = [int(r["e.id"]) for r in rows]
+            if not ids:
+                break
+            for eid in ids:
+                memory.client.execute(
+                    f"MATCH (e:Event {{id: {eid}}}) DETACH DELETE e", timeout_ms=30_000
+                )
+        memory.client.execute(
+            f'MATCH (s:Session {{session_id: "{ns}"}}) DETACH DELETE s', timeout_ms=30_000
+        )
 
     # ------------------------------------------------------------------ meta
 

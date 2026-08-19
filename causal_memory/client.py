@@ -23,12 +23,17 @@ class HydraDBClient:
         namespace: str = "default",
         cell_id: str = "cell-0",
         admin_url: Optional[str] = None,
+        default_timeout_ms: int = 25_000,
     ):
         self.url = url.rstrip("/")
         self.auth_token = auth_token
         self.namespace = namespace
         self.cell_id = cell_id
         self.admin_url = admin_url or self.url
+        # Engine admission control rejects client_query_runtime_ms > 30000.
+        # Use a generous-but-valid deadline so graph-wide deletes and path
+        # traversals on grown graphs do not hit the default short deadline.
+        self.default_timeout_ms = default_timeout_ms
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Bearer {auth_token}",
@@ -62,6 +67,8 @@ class HydraDBClient:
             body["bookmark"] = bookmark
         if timeout_ms:
             body["timeout_ms"] = timeout_ms
+        elif self.default_timeout_ms:
+            body["timeout_ms"] = self.default_timeout_ms
         if page_size:
             body["page_size"] = page_size
         if consistency:
@@ -74,11 +81,11 @@ class HydraDBClient:
         response.raise_for_status()
         return response.json()
 
-    def execute(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> List[Dict]:
+    def execute(self, query: str, parameters: Optional[Dict[str, Any]] = None, timeout_ms: Optional[int] = None) -> List[Dict]:
         """
         Execute a query and return rows as list of dicts.
         """
-        result = self.query(query, parameters)
+        result = self.query(query, parameters, timeout_ms=timeout_ms)
         columns = result.get("columns", [])
         rows = result.get("rows", [])
 
