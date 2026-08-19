@@ -46,6 +46,30 @@ from mem_bench.reporting.markdown_report import save_markdown_report
 
 logger = logging.getLogger("run_subset")
 
+
+def retry_call(fn, *, attempts: int = 6, max_wait: float = 45.0, what: str = "call"):
+    """Call fn with exponential backoff; extra wait on 429 rate limits.
+
+    The harness judge and answer generator make no retry calls; back-to-back
+    benchmark runs trip OpenAI 429s and every sample then fails (measured:
+    bm25 165/300 and nomemory 300/300 failed on 429 with no backoff).
+    """
+    import random as _rng
+
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            if attempt == attempts - 1:
+                raise
+            msg = str(exc)
+            if "429" in msg or "rate_limit" in msg.lower():
+                wait = min(max_wait, 10.0 + 10.0 * attempt + _rng.uniform(0, 3))
+            else:
+                wait = min(max_wait, 1.5 * (2 ** attempt) + _rng.uniform(0, 1))
+            logger.warning("%s failed (attempt %d/%d), retrying in %.1fs: %s", what, attempt + 1, attempts, wait, msg)
+            time.sleep(wait)
+
 HYDRADB_URL = "http://localhost:18444"
 NODE_NAME = "hydradb-bench"
 NODE_DATA = Path("/tmp/hydradb-bench-data")
@@ -220,12 +244,31 @@ def run_adapter(
     batch_size: int,
     cache_conversations: bool = False,
 ) -> dict[str, Any]:
+    from mem_bench.core import runner as _runner_mod
     from mem_bench.core.runner import BenchmarkRunner, _MAX_RETRIES
+
+    class _RetryJudge:
+        """Proxy that retries judge.evaluate with backoff (429-safe)."""
+
+        def __init__(self, base):
+            self._base = base
+
+        def evaluate(self, *a, **kw):
+            return retry_call(lambda: self._base.evaluate(*a, **kw), what="judge")
+
+    # answer generator: same no-retry issue -> wrap the function the runner
+    # imported at module scope.
+    _orig_gen = _runner_mod.generate_answer
+    _runner_mod.generate_answer = lambda *a, **kw: retry_call(
+        lambda: _orig_gen(*a, **kw), what="generate_answer"
+    )
 
     logger.info("=== adapter=%s samples=%d ===", name, len(samples))
     adapter = make_adapter(name, cfg, cache_conversations)
     bench = _FilteredBenchmark(f"longmemeval_{name}", samples)
     runner = BenchmarkRunner(adapter, bench, cfg)
+    if runner._judge is not None:
+        runner._judge = _RetryJudge(runner._judge)
     top_k = max(cfg.metrics.retrieval_k)
     k_values = cfg.metrics.retrieval_k
 

@@ -1,0 +1,11 @@
+{
+  "benchmark": "longmemeval",
+  "split": "s",
+  "adapter": "nomemory",
+  "num_samples": 0,
+  "num_failed": 300,
+  "aggregate_metrics": {},
+  "type_breakdown": {},
+  "total_seconds": 0,
+  "metadata": {}
+}

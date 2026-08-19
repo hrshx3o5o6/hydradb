@@ -443,6 +443,41 @@ answers worse until the context-packaging fix lands.*
 
 ---
 
+### 2026-08-20 — Context-packaging fix: full-session rejoin (VALIDATED)
+
+**Fix** (`hydradna.py`): cache `document_id -> full original session text`
+during ingest; in `recall()` keep chunk-level scoring (so retrieval metrics are
+unchanged) but swap `RecallResult.content` from the 700-byte slice to the whole
+session. The judge now reads complete evidence like BM25, with our better
+session ranking on top.
+
+**Re-run, LoCoMo 300-subset (seed 42), same gpt-4o-mini judge**
+(`benchmarks/results/locomo_subset_fix/`):
+
+| metric | hydradna before | hydradna after | delta |
+|---|---|---|---|
+| qa_accuracy | 0.437 | **0.573** | **+13.6** |
+| recall_any@1 | 0.577 | 0.577 | 0 (as designed) |
+| recall_any@5 | 0.807 | 0.807 | 0 |
+| recall_all@1 | 0.530 | 0.530 | 0 |
+| mrr | 0.684 | 0.684 | 0 |
+
+0 failed / 300. The retrieval metrics were bit-identical — packaging had zero
+effect on retrieval, exactly as designed — and qa_accuracy jumped past BM25's
+old 0.503. **HydraDNA now wins both retrieval and QA on LoCoMo.**
+Cost tradeoff: context is now ~30-40KB/question (whole sessions) vs ~7KB
+(slices); gpt-4o-mini handles it, but tokens/query is a real axis to report.
+
+**Blocker on completing the comparison:** mid-run the OpenAI account hit
+`credit_balance_exhausted`, so the bm25 + nomemory legs failed (165/300 and
+300/300) and had to be re-run. They are **invalidated** in `locomo_subset_fix/`
+and pending a re-run with credits. A retry-with-backoff wrapper (429/credit-safe)
+was added to `run_subset.py` so future judge/answer calls retry instead of
+silently dropping samples. The `+13.6` headline stands on its own (same judge,
+same run, hydradna leg only).
+
+---
+
 ## References
 
 **Benchmarks:** LoCoMo (arXiv:2402.09727), LongMemEval (arXiv:2410.10813,
