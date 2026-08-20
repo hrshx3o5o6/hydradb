@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hydradna"
+version = "0.1.0"
+description = "Causal memory layer for AI agents, built on HydraDB. Events become nodes, LLM-inferred CAUSES/ENABLES edges capture why things happened; retrieval walks causal paths; exposed over MCP (observe/link/search/why)."
+readme = "causal_memory/README.md"
+requires-python = ">=3.11"
+license = { text = "AGPL-3.0" }
+keywords = ["memory", "causal", "graph", "mcp", "agents", "rag"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "mcp>=2.0.0",
+    "requests>=2.28.0",
+    "neo4j>=5.0.0",
+]
+
+[project.scripts]
+hydradna = "causal_memory.cli:main"
+
+[tool.setuptools]
+packages = ["causal_memory"]

@@ -38,3 +38,4 @@ docs/formal-methods-docs/
 docs/formal-methods/distributed-protocol-testing/
 # Generated PDFs (book builds, exports)
 *.pdf
+/deploy/data/

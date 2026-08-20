@@ -1,0 +1,49 @@
+services:
+  # HydraDB causal-graph store. Exposes bolt 7687, query API 8443, admin 9090.
+  hydradb:
+    image: ghcr.io/hydra-db/hydradb:latest
+    container_name: hydradna-hydradb
+    ports:
+      - "18443:7687"
+      - "18444:8443"
+      - "19090:9090"
+    environment:
+      GRAPH_ADVERTISED_BOLT_ADDR: "127.0.0.1:18443"
+      GRAPH_BOLT_NODE_ADDRESSES: "node-0=127.0.0.1:18443"
+      GRAPH_AUTH_TOKEN_FILE: /data/auth-token
+      GRAPH_ALLOW_PLAINTEXT: "true"
+      CLOUD_PROVIDER: local
+      GRAPH_ID: default
+      GRAPH_CELL_ID: cell-0
+      GRAPH_NODE_ID: node-0
+      GRAPH_NAMESPACE: default
+      GRAPH_CELLS: cell-0
+      GRAPH_DATA_CACHE_DIR: /data/cache
+      LOCAL_PATH: /data/store
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8443 && exec 3<&- && exec 3>&-'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  # HydraDNA causal-memory MCP server (stdio transport). In a compose stack the
+  # useful path is running `hydradna` on the host, pointed at this node
+  # (HYDRADB_URL=http://localhost:18444). This container exists so the packaged
+  # image is buildable/verifiable end-to-end.
+  hydradna:
+    build:
+      context: ..
+      dockerfile: deploy/hydradna.Dockerfile
+    container_name: hydradna-mcp
+    depends_on:
+      hydradb:
+        condition: service_healthy
+    environment:
+      HYDRADB_URL: http://hydradb:8443
+      HYDRADB_ADMIN_URL: http://hydradb:9090
+      HYDRADB_TOKEN: local-dev-auth-token-32-characters-long
+    stdin_open: true
+    tty: true

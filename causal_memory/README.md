@@ -193,6 +193,48 @@ RETURN e
 
 [Hack Hydra](https://hackhydra.hydradb.com) - Track 03: Memory + Context Retrieval
 
+## Install
+
+```bash
+pip install hydradna          # or: uvx hydradna --version
+```
+
+Requires a running HydraDB node (see Docker Compose below).
+
+## Run the MCP server (stdio)
+
+```bash
+HYDRADB_URL=http://localhost:18444 \
+HYDRADB_TOKEN=local-dev-auth-token-32-characters-long \
+hydradna
+```
+
+Register in an MCP client (Claude Desktop, opencode, ...):
+
+```json
+{ "hydradna": { "type": "local",
+    "command": ["hydradna"],
+    "env": { "HYDRADB_URL": "http://localhost:18444",
+             "HYDRADB_TOKEN": "local-dev-auth-token-32-characters-long" } } }
+```
+
+Exposes 12 tools: `observe`, `recent_events`, `propose_edges_window`,
+`link`, `search`, `get_event`, `find_causes`, `find_effects`, `causal_path`,
+`why`, `graph_dump`, `reset`.
+
+## Docker Compose (zero-config HydraDB)
+
+```bash
+cd deploy
+mkdir -p data/store data/cache
+printf 'local-dev-auth-token-32-characters-long' > data/auth-token
+docker compose up -d hydradb
+# node up on 18443 (bolt) / 18444 (query API) / 19090 (admin)
+```
+
+Then run `hydradna` on the host pointed at `http://localhost:18444`, or start
+the packaged `hydradna` container with `docker compose up -d hydradna`.
+
 ## License
 
 MIT
