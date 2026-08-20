@@ -478,6 +478,35 @@ same run, hydradna leg only).
 
 ---
 
+### 2026-08-21 — Offline comparison with local judge (credits unavailable)
+
+OpenAI credits are exhausted, so the full 3-adapter LoCoMo 300-subset was
+re-run with a **local Ollama judge** (`llama3.2:3b` via OpenAI-compatible
+`base_url`, added `--judge-model/--judge-base-url` CLI to `run_subset.py`).
+Same subset, same seed 42, same harness; 0 failed / 300 across all adapters
+(`benchmarks/results/locomo_subset_local/`):
+
+| metric | hydradna | bm25 | nomemory |
+|---|---|---|---|
+| qa_accuracy | **0.350** | 0.347 | 0.073 |
+| recall_any@1 | **0.577** | 0.487 | 0.000 |
+| recall_any@5 | **0.807** | 0.793 | 0.000 |
+| recall_all@1 | **0.530** | 0.430 | 0.000 |
+| mrr | **0.684** | 0.613 | 0.000 |
+| ndcg@5 | **0.679** | 0.616 | 0.000 |
+
+Notes:
+- **Retrieval metrics are judge-free** and bit-identical to the gpt-4o-mini
+  run: HydraDNA wins recall_any@1 (+9), recall_all@1 (+10), mrr (+7), ndcg@5
+  (+6) and recall_any@5 (+1.4). The retrieval claim is fully validated offline.
+- qa_accuracy compresses under the weak 3B judge (0.350 vs 0.347 — a near tie;
+  gpt-4o-mini showed +13.6). QA differentiation is judge-strength-dependent;
+  retrieval advantage is not.
+- nomemory qa 0.073 (not 0) confirms the 3B judge occasionally says "yes" to
+  empty context — noisier than gpt-4o-mini, but the canary still holds.
+
+---
+
 ## References
 
 **Benchmarks:** LoCoMo (arXiv:2402.09727), LongMemEval (arXiv:2410.10813,
