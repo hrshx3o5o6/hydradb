@@ -357,6 +357,8 @@ def main() -> None:
     ap.add_argument("--benchmark", default="longmemeval", choices=["longmemeval", "locomo"])
     ap.add_argument("--config", default=str(MODULE_DIR / "mem-bench.toml"))
     ap.add_argument("--output", default=str(MODULE_DIR.parent / "results" / "lme_subset"))
+    ap.add_argument("--judge-model", default=None, help="override judge/answer model (e.g. qwen3.5:4b for local Ollama)")
+    ap.add_argument("--judge-base-url", default=None, help="override judge base URL (e.g. http://localhost:11434/v1 for Ollama)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s")
@@ -364,6 +366,10 @@ def main() -> None:
     cfg = load_config(args.config)
     cfg.split = args.split
     cfg.benchmark = args.benchmark
+    if args.judge_model:
+        cfg.judge.model = args.judge_model
+    if args.judge_base_url:
+        cfg.judge.base_url = args.judge_base_url
 
     if args.benchmark == "locomo":
         from mem_bench.benchmarks.locomo import LoCoMoBenchmark
