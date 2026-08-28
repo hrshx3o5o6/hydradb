@@ -163,8 +163,7 @@ PAGE = """<!doctype html>
 
   #trace { position:absolute; top:0; right:0; bottom:0; width:280px;
            z-index:10; background:rgba(22,23,27,.92); border-left:1px solid var(--line);
-           display:flex; flex-direction:column; font-size:10px; overflow:hidden;
-           pointer-events:none; }
+           display:flex; flex-direction:column; font-size:10px; overflow:hidden; }
   #trace .tr-h { flex:0 0 auto; padding:10px 14px; border-bottom:1px solid var(--line);
                  color:var(--accent); font-size:9px; letter-spacing:.2em; font-weight:700; }
   #trace .tr-h2 { flex:0 0 auto; color:var(--dim); }
@@ -195,6 +194,9 @@ PAGE = """<!doctype html>
   #trace .ev-item { margin-bottom:6px; padding:6px 10px; background:var(--bg2);
                     border:1px solid var(--line); border-left:2px solid var(--line); }
   #trace .ev-item.user { border-left-color:var(--accent); }
+  #trace .ev-item.reasoning { border-left-color:var(--green); background:rgba(52,211,153,.06); }
+  #trace .ev-item.reasoning .ev-text { color:var(--faint); font-style:italic; }
+  #trace .ev-item.reasoning .ev-text::before { content:"✳ "; color:var(--green); }
   #trace .ev-item.new { animation:evIn .5s ease-out both; }
   @keyframes evIn { from { background:rgba(255,87,25,.18); } to { background:var(--bg2); } }
   #trace .ev-top { display:flex; justify-content:space-between; gap:8px; margin-bottom:3px;
@@ -204,6 +206,9 @@ PAGE = """<!doctype html>
   #trace .ev-text { color:var(--dim); font-size:9px; line-height:1.4; word-break:break-word; }
   #trace .ev-item.user .ev-text { color:var(--ink); }
   #trace .ev-text::before { content:"▸ "; color:var(--accent); }
+  #trace .ev-item { cursor:pointer; }
+  #trace .ev-item.expanded .ev-text::before { content:"▾ "; }
+  #trace .ev-item.expanded .ev-text { white-space:pre-wrap; max-height:200px; overflow-y:auto; }
 
   footer { flex:0 0 auto; display:flex; align-items:center; gap:20px;
            padding:6px 18px; background:var(--panel); border-top:1px solid var(--line);
@@ -407,12 +412,14 @@ PAGE = """<!doctype html>
 
   // ---- interaction: orbit + zoom + hover/select ----
   view.addEventListener("wheel", (ev)=>{
+    if (ev.target.closest && ev.target.closest("#trace")) return;
     ev.preventDefault();
     cam.dist *= Math.exp(ev.deltaY * 0.0011);
     cam.dist = Math.max(40, Math.min(4000, cam.dist));
   }, {passive:false});
 
   view.addEventListener("mousedown", (ev)=>{
+    if (ev.target.closest && ev.target.closest("#trace")) return;
     if (ev.button !== 0) return;
     drag = { x: ev.clientX, y: ev.clientY, yaw: cam.yaw, pitch: cam.pitch };
     view.classList.add("orbs");
@@ -578,6 +585,29 @@ PAGE = """<!doctype html>
   function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 
   let lastEventId = null;
+  let lastEvents = [];
+  const expandedEvents = new Set();
+  function renderEvents(evs){
+    const list = document.getElementById("eventList");
+    let html = "";
+    for (const ev of evs.slice(0, 14)){
+      const isUser = ev.type === "user";
+      const isReasoning = ev.type === "reasoning";
+      let cls = isUser ? "ev-item user" : (isReasoning ? "ev-item reasoning" : "ev-item");
+      if (expandedEvents.has(ev.id)) cls += " expanded";
+      const t = ev.timestamp ? fmtTime(ev.timestamp * 1000) : "--:--:--";
+      const full = ev.text || "";
+      const txt = isUser ? full.slice(0, 140) : full.slice(0, 90);
+      const shown = full.length > txt.length ? txt + "…" : full;
+      html += '<div class="' + cls + '" data-id="' + ev.id + '"><div class="ev-top"><b>' +
+        (isUser ? "YOU" : (isReasoning ? "THOUGHT" : (ev.type || "event"))) + '</b><span>' + t + '</span></div>' +
+        '<div class="ev-text">' + esc(shown) +
+        (expandedEvents.has(ev.id) ? '<div class="ev-full">' + esc(full) + '</div>' : '') +
+        '</div></div>';
+    }
+    list.innerHTML = html;
+  }
+
   async function pollEvents(){
     let evs;
     try {
@@ -585,22 +615,21 @@ PAGE = """<!doctype html>
       evs = await r.json();
     } catch(e){ return; }
     if (!evs.length) return;
+    lastEvents = evs;
     const fresh = evs[0];
     if (lastEventId === fresh.id) return;
     lastEventId = fresh.id;
-    const list = document.getElementById("eventList");
-    let html = "";
-    for (const ev of evs.slice(0, 14)){
-      const isUser = ev.type === "user";
-      const cls = isUser ? "ev-item user" : "ev-item";
-      const t = ev.timestamp ? fmtTime(ev.timestamp * 1000) : "--:--:--";
-      const txt = isUser ? (ev.text || "").slice(0, 140) : (ev.text || "").slice(0, 90);
-      html += '<div class="' + cls + '"><div class="ev-top"><b>' +
-        (isUser ? "YOU" : (ev.type || "event")) + '</b><span>' + t + '</span></div>' +
-        '<div class="ev-text">' + esc(txt) + '</div></div>';
-    }
-    list.innerHTML = html;
+    renderEvents(evs);
   }
+
+  document.getElementById("eventList").addEventListener("click", (e) => {
+    const item = e.target.closest(".ev-item");
+    if (!item) return;
+    const id = Number(item.dataset.id);
+    if (expandedEvents.has(id)) expandedEvents.delete(id);
+    else expandedEvents.add(id);
+    if (lastEvents.length) renderEvents(lastEvents);
+  });
 
   async function poll(){
     try {

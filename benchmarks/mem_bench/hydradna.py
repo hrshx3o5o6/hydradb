@@ -21,6 +21,9 @@ Env vars:
     HYDRADB_AUTH_TOKEN   bearer token (default local-dev token)
     HYDRA_CAUSAL         "1" to run causal discovery during ingest
                          (default: enabled)
+    HYDRA_CAUSAL_EXPAND  "1" to expand recall hits along CAUSES/ENABLES edges
+                         (default: enabled; set "0" to ablate structural
+                         retrieval, e.g. the single_hop regression)
 """
 
 from __future__ import annotations
@@ -114,6 +117,7 @@ class HydraDNAAdapter(BaseAdapter):
             "HYDRADB_AUTH_TOKEN", "local-dev-auth-token-32-characters-long"
         )
         self._causal = bool(int(os.environ.get("HYDRA_CAUSAL", "1")))
+        self._causal_expand = bool(int(os.environ.get("HYDRA_CAUSAL_EXPAND", "1")))
         self._llm_model = kwargs.pop("llm_model", None)
         self._memory: Any = None
         self._docs: dict[str, dict[str, tuple[str, str]]] = {}
@@ -261,17 +265,18 @@ class HydraDNAAdapter(BaseAdapter):
             doc_id, content = lookup
             bump(doc_id, content, 1.0)
             # 3. causal neighbors of each hit (structural retrieval)
-            try:
-                for path in memory.find_causes(event.id, max_hops=2):
-                    for ev in path.events:
-                        if (found := bucket.get(ev.text)) is not None:
-                            bump(found[0], found[1], 0.9)
-                for path in memory.find_effects(event.id, max_hops=2):
-                    for ev in path.events:
-                        if (found := bucket.get(ev.text)) is not None:
-                            bump(found[0], found[1], 0.9)
-            except Exception:
-                logger.debug("hydradna: causal expansion failed", exc_info=True)
+            if self._causal_expand:
+                try:
+                    for path in memory.find_causes(event.id, max_hops=2):
+                        for ev in path.events:
+                            if (found := bucket.get(ev.text)) is not None:
+                                bump(found[0], found[1], 0.9)
+                    for path in memory.find_effects(event.id, max_hops=2):
+                        for ev in path.events:
+                            if (found := bucket.get(ev.text)) is not None:
+                                bump(found[0], found[1], 0.9)
+                except Exception:
+                    logger.debug("hydradna: causal expansion failed", exc_info=True)
 
         # 2. word-overlap fallback
         qwords = set(re.findall(r"[a-z0-9]+", query.query.lower())) - STOPWORDS

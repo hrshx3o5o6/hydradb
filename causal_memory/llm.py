@@ -34,7 +34,7 @@ class LLM:
     def __init__(self, model: str | None = None):
         self.gemini_key = os.environ.get("GEMINI_API_KEY")
         self.openai_key = os.environ.get("OPENAI_API_KEY")
-        self.model = model
+        self.model = model or os.environ.get("LLM_MODEL")
         if not self.gemini_key and not self.openai_key:
             raise LLMError(
                 "No LLM credentials: set GEMINI_API_KEY or OPENAI_API_KEY."

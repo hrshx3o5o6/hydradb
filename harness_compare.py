@@ -148,20 +148,9 @@ def section(title):
     print("=" * 66)
 
 
-def main():
-    token = os.environ.get("HYDRADB_TOKEN", "local-dev-auth-token-32-characters-long")
-    mem = CausalMemory(
-        url="http://localhost:8443",
-        auth_token=token,
-        admin_url="http://localhost:9090",
-    )
-    if not (mem.client.ready_check() or mem.client.health_check()):
-        print("HydraDB not reachable. Start it first (docker).")
-        sys.exit(1)
-    print("HydraDB reachable. LLM:", "GEMINI" if os.environ.get("GEMINI_API_KEY") else "OPENAI")
-    llm = LLM()
-
-    story, _ = build_story()
+def run_trial(mem, llm, seed, dry_run=False):
+    """Run one full comparison. Returns verdict dict + answers."""
+    story, _ = build_story(seed=seed)
     print(f"Story: {len(story)} observations, 4 developers, 1 day")
     print(f"True causal chain depth: {len(TRUE_CHAIN)} events, buried in noise")
     chain_positions = [next(i for i, s in enumerate(story) if s[1] == txt)
@@ -171,14 +160,13 @@ def main():
           f"chain starts at {chain_positions[0]}, which is "
           f"{'INSIDE' if chain_positions[0] >= len(story) - CONTEXT_WINDOW_LINES else 'SCROLLED OUT of'} the window")
 
-    if "--reset" in sys.argv:
-        mem.reset()
-        print("Wiped store for a clean comparison.")
+    mem.reset()
+    print("Wiped store for a clean comparison.")
 
     # ------------------------------------------------------------- seed data
     section("SEED — observations stream into HydraDB")
     events = {}
-    for i, (session, text, t) in enumerate(story):
+    for session, text, t in story:
         e = mem.observe(text, session_id=session, timestamp=t)
         events[text] = e
     print(f"  stored {len(story)} events")
@@ -192,6 +180,13 @@ def main():
     flat_log = "\n".join(window)
     print(f"  ({len(log_lines)} events total; harness feeds model only the last "
           f"{len(window)} lines)")
+
+    # Deterministic baseline recall: of the TRUE_CHAIN, how many events even
+    # survive inside the flat window the model sees? Independent of the judge.
+    window_texts = set(txt for (_s, txt, _t) in story[-CONTEXT_WINDOW_LINES:])
+    base_recall = sum(1 for t in TRUE_CHAIN if t in window_texts) / len(TRUE_CHAIN)
+    print(f"  [RETRIEVAL RECALL] true-chain events visible in flat window: "
+          f"{base_recall:.0%} ({sum(1 for t in TRUE_CHAIN if t in window_texts)}/{len(TRUE_CHAIN)})")
 
     answer_a = llm.complete(
         system=(
@@ -214,7 +209,6 @@ def main():
     print("\n2) Resolving question -> target -> causal path...")
     target = events["Ava raised the pool size to 20 connections"]
     paths = mem.find_causes(target.id, max_hops=8)
-    paths.sort(key=lambda p: -len(p.events))  # most complete chain first
     print(f"   target id {target.id}, {len(paths)} causal path(s)")
 
     # Prefer the path that best matches the true chain; the naive longest path
@@ -228,7 +222,10 @@ def main():
         return depth, len(p.events), -sum(r.confidence for r in p.relations)
 
     best = max(paths, key=chain_score) if paths else None
+    true_hits = 0
     if best:
+        best_texts = [e.text for e in best.events]
+        true_hits = sum(1 for t in TRUE_CHAIN if t in best_texts)
         print("\n   Discovered causal chain grounding the answer:")
         for i, ev in enumerate(best.events):
             note = ""
@@ -237,6 +234,22 @@ def main():
                 mech = f' — "{r.mechanism}"' if r.mechanism else ""
                 note = f"  <=(conf {r.confidence:.2f}){mech}"
             print(f"     {ev.text}{note}")
+        print(f"   [true-chain events recovered: {true_hits}/{len(TRUE_CHAIN)}]")
+
+    # Deterministic retrieval metrics for the causal path (no LLM judge).
+    causal_recall = true_hits / len(TRUE_CHAIN)
+    path_len = len(best.events) if best else 0
+    causal_precision = true_hits / path_len if path_len else 0.0
+    # Context efficiency: tokens the model must ingest to answer.
+    base_tokens = sum(len(l.split()) for l in window) + len(QUESTION.split())
+    causal_tokens = sum(len(e.text.split()) for e in best.events) + len(QUESTION.split()) \
+        if best else len(QUESTION.split())
+    print(f"   [RETRIEVAL RECALL] causal graph recovered {true_hits}/{len(TRUE_CHAIN)} "
+          f"= {causal_recall:.0%}")
+    print(f"   [RETRIEVAL PRECISION] {true_hits} true events in path of {path_len} "
+          f"= {causal_precision:.0%}")
+    print(f"   [CONTEXT EFFICIENCY] flat window {base_tokens} tokens vs causal path "
+          f"{causal_tokens} tokens = {base_tokens/max(causal_tokens,1):.1f}x less context")
 
     print("\n3) Narrating from the discovered path...")
     answer_b = mem.why(QUESTION)
@@ -268,11 +281,70 @@ def main():
         verdict = extract_json(judge)
     except Exception:
         verdict = {}
+    verdict["true_hits"] = true_hits
+    verdict["base_recall"] = base_recall
+    verdict["causal_recall"] = causal_recall
+    verdict["causal_precision"] = causal_precision
+    verdict["context_ratio"] = base_tokens / max(causal_tokens, 1)
     print("\nJudge verdict:")
     for key in ("answer_a", "answer_b"):
         s = verdict.get(key, {})
         print(f"  {key}: accuracy={s.get('accuracy')} precision={s.get('precision')}")
     print("  winner:", verdict.get("winner", "?"))
+    return verdict
+
+
+def main():
+    token = os.environ.get("HYDRADB_TOKEN", "local-dev-auth-token-32-characters-long")
+    mem = CausalMemory(
+        url="http://localhost:8443",
+        auth_token=token,
+        admin_url="http://localhost:9090",
+    )
+    if not (mem.client.ready_check() or mem.client.health_check()):
+        print("HydraDB not reachable. Start it first (docker).")
+        sys.exit(1)
+    print("HydraDB reachable. LLM:", "GEMINI" if os.environ.get("GEMINI_API_KEY") else "OPENAI")
+    llm = LLM()
+
+    seeds = [7]
+    if "--trials" in sys.argv:
+        try:
+            seeds = list(range(1, int(sys.argv[sys.argv.index("--trials") + 1]) + 1))
+        except (IndexError, ValueError):
+            print("usage: --trials N")
+            sys.exit(1)
+
+    results = []
+    for seed in seeds:
+        print("\n\n###################### TRIAL seed=%d ######################" % seed)
+        results.append(run_trial(mem, llm, seed))
+
+    if len(results) > 1:
+        section("AGGREGATE OVER %d TRIALS" % len(results))
+        def avg(key):
+            vals = [r.get(key, 0) for r in results]
+            return sum(vals) / len(vals)
+        def avg_sub(main_key, sub):
+            vals = []
+            for r in results:
+                s = r.get(main_key, {})
+                if isinstance(s, dict):
+                    vals.append(s.get(sub, 0))
+            return sum(vals) / len(vals) if vals else 0
+        from collections import Counter
+        winners = Counter(r.get("winner", "?") for r in results)
+        print(f"accuracy   A={avg_sub('answer_a', 'accuracy'):4.2f}   "
+              f"B={avg_sub('answer_b', 'accuracy'):4.2f}")
+        print(f"precision  A={avg_sub('answer_a', 'precision'):4.2f}   "
+              f"B={avg_sub('answer_b', 'precision'):4.2f}")
+        print(f"true-chain recovery in discovered paths: "
+              f"{avg('true_hits'):4.2f}/{len(TRUE_CHAIN)}")
+        print(f"retrieval recall (base window)  = {avg('base_recall'):6.1%}")
+        print(f"retrieval recall (causal path)  = {avg('causal_recall'):6.1%}")
+        print(f"retrieval precision (causal)    = {avg('causal_precision'):6.1%}")
+        print(f"context efficiency (base/causal)= {avg('context_ratio'):6.1f}x")
+        print("winners:", dict(winners))
 
 
 if __name__ == "__main__":
