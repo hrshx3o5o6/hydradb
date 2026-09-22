@@ -10,6 +10,7 @@ HydraDB's query engine contract (verified against live node):
 - Path procedures use CALL algo.SPpaths / SSpaths / MSpaths ... YIELD ... RETURN.
 """
 
+import json
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 
@@ -40,26 +41,37 @@ class Event:
         """Deterministic integer event id from content, safe to recompute."""
         return hash_id(f"{session_id}|{text}|{timestamp}")
 
-    def props(self) -> str:
-        """Property map string for use inside a node pattern."""
-        props = [
-            f'id: {self.id}',
-            f'text: "{self.text}"',
-            f'timestamp: {self.timestamp}',
-            f'session_id: "{self.session_id}"',
-            f'type: "{self.event_type}"',
-        ]
+    def cypher_props(self, prefix: str = "e") -> "tuple[str, Dict[str, Any]]":
+        """
+        Property map fragment using $-parameters (engine-verified: opencypher.rs
+        threads `parameters: &BTreeMap<String, VertexPropertyValue>` through
+        lower_create_mutations/lower_simple_merge, and the HTTP client's
+        `parameters` body field maps 1:1 onto it). Property VALUES never enter
+        the query text, so arbitrary event text (quotes, backslashes,
+        newlines) is safe.
 
+        Returns (fragment, params) where fragment goes inside `{...}` in the
+        pattern and params merges into the query's top-level parameters dict.
+        Prefix must be unique per node/edge referenced in a single query.
+        """
+        fields = {
+            "id": self.id,
+            "text": self.text,
+            "timestamp": self.timestamp,
+            "session_id": self.session_id,
+            "type": self.event_type,
+        }
         if self.topic:
-            props.append(f'topic: "{self.topic}"')
+            fields["topic"] = self.topic
+        fields.update(self.metadata)
 
-        for key, value in self.metadata.items():
-            if isinstance(value, str):
-                props.append(f'{key}: "{value}"')
-            else:
-                props.append(f'{key}: {value}')
-
-        return ", ".join(props)
+        parts = []
+        params: Dict[str, Any] = {}
+        for key, value in fields.items():
+            pname = f"{prefix}_{key}"
+            parts.append(f"{key}: ${pname}")
+            params[pname] = value
+        return ", ".join(parts), params
 
 
 @dataclass
@@ -74,28 +86,46 @@ class CausalRelation:
     timestamp: Optional[int] = None
     evidence: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Provenance: one entry per agent/session that proposed this edge, e.g.
+    # {"session_id": "...", "confidence": 0.9, "mechanism": "...", "timestamp": 123}.
+    # Corroboration (multiple agreeing entries) may raise aggregate confidence;
+    # a CONFLICTS edge on the same pair means it must NOT be raised further.
+    proposed_by: List[Dict[str, Any]] = field(default_factory=list)
+    conflict_count: int = 0
+    # Counterfactual necessity: True if a narrow interventional check judged
+    # the target would NOT plausibly have occurred without the source
+    # (confidence-band routing gate; see discovery_core.route_confidence).
+    necessity: Optional[bool] = None
 
-    def props(self) -> str:
-        """Edge property map string."""
-        props = [f"confidence: {self.confidence}"]
-
+    def cypher_props(self, prefix: str = "r") -> "tuple[str, Dict[str, Any]]":
+        """Edge property map fragment using $-parameters. See Event.cypher_props."""
+        fields: Dict[str, Any] = {"confidence": self.confidence}
         if self.mechanism:
-            props.append(f'mechanism: "{self.mechanism}"')
-
+            fields["mechanism"] = self.mechanism
         if self.timestamp:
-            props.append(f"timestamp: {self.timestamp}")
-
+            fields["timestamp"] = self.timestamp
         if self.evidence:
-            evidence_str = ", ".join(f'"{e}"' for e in self.evidence)
-            props.append(f"evidence: [{evidence_str}]")
+            # Stored vertex/edge properties are scalar-only (engine's
+            # VertexPropertyValue: Integer/SignedInteger/Bool/Float/String —
+            # verified in src/core/model.rs, no List/Map variant). Encode as
+            # JSON text rather than a Cypher list literal, which is a query
+            # PARAMETER type but not a storable PROPERTY type.
+            fields["evidence"] = json.dumps(list(self.evidence))
+        if self.proposed_by:
+            fields["proposed_by"] = json.dumps(self.proposed_by)
+        if self.conflict_count:
+            fields["conflict_count"] = self.conflict_count
+        if self.necessity is not None:
+            fields["necessity"] = self.necessity
+        fields.update(self.metadata)
 
-        for key, value in self.metadata.items():
-            if isinstance(value, str):
-                props.append(f'{key}: "{value}"')
-            else:
-                props.append(f'{key}: {value}')
-
-        return ", ".join(props)
+        parts = []
+        params: Dict[str, Any] = {}
+        for key, value in fields.items():
+            pname = f"{prefix}_{key}"
+            parts.append(f"{key}: ${pname}")
+            params[pname] = value
+        return ", ".join(parts), params
 
 
 @dataclass

@@ -12,6 +12,7 @@ Event ids are deterministic hashes of (session, text, timestamp) so a harness
 re-logging the same fact resolves to the same vertex.
 """
 
+import json
 import time
 from typing import Optional, List, Dict, Any
 
@@ -19,6 +20,8 @@ from .client import HydraDBClient
 from .llm import LLM, LLMError, extract_json
 from .schema import Event, CausalRelation, CausalPath, hash_id
 from .tracing import Trace
+
+_CAUSAL_TYPES = ("CAUSES", "ENABLES")
 
 
 class CausalMemory:
@@ -77,12 +80,52 @@ class CausalMemory:
             metadata=metadata or {},
         )
 
+        event_props, event_params = event.cypher_props(prefix="e")
         query = (
-            f"MERGE (s:Session {{id: {session_root}, session_id: \"{session_id}\"}})"
-            f"-[:HAS_EVENT]->(e:Event {{{event.props()}}})"
+            "MERGE (s:Session {id: $s_id, session_id: $s_session_id})"
+            f"-[:HAS_EVENT]->(e:Event {{{event_props}}})"
         )
-        self.client.execute(query)
+        params = {"s_id": session_root, "s_session_id": session_id, **event_params}
+        self.client.execute(query, parameters=params)
         return event
+
+    def _get_relation(self, source_id: int, target_id: int, relation_type: str) -> Optional[CausalRelation]:
+        """Fetch the single edge of `relation_type` between two events, if any."""
+        query = (
+            f"MATCH (a:Event {{id: $src}})-[r:{relation_type}]->(b:Event {{id: $dst}}) "
+            "RETURN r.confidence, r.mechanism, r.timestamp, r.evidence, "
+            "r.proposed_by, r.conflict_count, r.necessity"
+        )
+        rows = self.client.execute(query, parameters={"src": source_id, "dst": target_id})
+        if not rows:
+            return None
+        row = rows[0]
+        proposed_by = []
+        raw_pb = row.get("r.proposed_by")
+        if raw_pb:
+            try:
+                proposed_by = json.loads(raw_pb)
+            except (TypeError, ValueError):
+                proposed_by = []
+        evidence = []
+        raw_ev = row.get("r.evidence")
+        if raw_ev:
+            try:
+                evidence = json.loads(raw_ev)
+            except (TypeError, ValueError):
+                evidence = []
+        return CausalRelation(
+            source_id=source_id,
+            target_id=target_id,
+            relation_type=relation_type,
+            confidence=float(row.get("r.confidence") if row.get("r.confidence") is not None else 1.0),
+            mechanism=row.get("r.mechanism"),
+            timestamp=int(row.get("r.timestamp")) if row.get("r.timestamp") else None,
+            evidence=evidence,
+            proposed_by=proposed_by,
+            conflict_count=int(row.get("r.conflict_count") or 0),
+            necessity=row.get("r.necessity"),
+        )
 
     def add_causal_relation(
         self,
@@ -92,27 +135,127 @@ class CausalMemory:
         confidence: float = 1.0,
         mechanism: Optional[str] = None,
         evidence: Optional[List[str]] = None,
+        proposer: Optional[str] = None,
     ) -> CausalRelation:
         """
-        Add (or merge, idempotently) a causal relationship between events.
+        Add (or merge) a causal relationship between events.
+
+        Provenance-aware: repeated proposals for the same (source, target,
+        type) append to `proposed_by` and may nudge aggregate confidence up
+        -- but ONLY when no conflicting edge exists on this pair. If the
+        OPPOSITE direction already carries a causal edge (CAUSES/ENABLES),
+        that is a genuine disagreement: a CONFLICTS edge is written/merged
+        between the two events and confidence is frozen, not boosted, no
+        matter how many proposers agree with either side.
         """
-        relation = CausalRelation(
+        now = int(time.time())
+        proposal_entry = {
+            "session_id": proposer or "unknown",
+            "confidence": confidence,
+            "mechanism": mechanism,
+            "timestamp": now,
+        }
+
+        conflict_edge = None
+        if relation_type in _CAUSAL_TYPES:
+            for other_type in _CAUSAL_TYPES:
+                conflict_edge = self._get_relation(target_id, source_id, other_type)
+                if conflict_edge:
+                    break
+
+        existing = self._get_relation(source_id, target_id, relation_type)
+        if existing:
+            merged_by = existing.proposed_by + [proposal_entry]
+            if conflict_edge:
+                new_confidence = existing.confidence
+                new_conflict_count = existing.conflict_count + 1
+            else:
+                # Corroboration: a second agreeing proposal nudges confidence
+                # toward the stronger of the two, capped so nothing coasts to
+                # false certainty from agreement volume alone.
+                new_confidence = min(0.98, max(existing.confidence, confidence) + 0.03)
+                new_conflict_count = existing.conflict_count
+            relation = CausalRelation(
+                source_id=source_id,
+                target_id=target_id,
+                relation_type=relation_type,
+                confidence=new_confidence,
+                mechanism=mechanism or existing.mechanism,
+                timestamp=now,
+                evidence=evidence or existing.evidence,
+                proposed_by=merged_by,
+                conflict_count=new_conflict_count,
+                necessity=existing.necessity,
+            )
+        else:
+            relation = CausalRelation(
+                source_id=source_id,
+                target_id=target_id,
+                relation_type=relation_type,
+                confidence=confidence,
+                mechanism=mechanism,
+                timestamp=now,
+                evidence=evidence or [],
+                proposed_by=[proposal_entry],
+                conflict_count=1 if conflict_edge else 0,
+            )
+
+        if existing:
+            self._set_relation_props(source_id, target_id, relation_type, relation)
+        else:
+            rel_props, rel_params = relation.cypher_props(prefix="r")
+            query = (
+                "MERGE (a:Event {id: $src})"
+                f"-[r:{relation.relation_type} {{{rel_props}}}]"
+                "->(b:Event {id: $dst})"
+            )
+            params = {"src": source_id, "dst": target_id, **rel_params}
+            self.client.execute(query, parameters=params)
+
+        if conflict_edge:
+            self._write_conflict(source_id, target_id, relation, conflict_edge)
+
+        return relation
+
+    def _set_relation_props(self, source_id: int, target_id: int, relation_type: str, relation: CausalRelation) -> None:
+        """Update an already-existing edge's properties in place (MATCH + SET),
+        instead of MERGE-with-full-props which would create a duplicate edge
+        every time any property (e.g. proposed_by) changes."""
+        rel_props, rel_params = relation.cypher_props(prefix="r")
+        set_clauses = ", ".join(f"r.{part.split(':')[0].strip()} = {part.split(':', 1)[1].strip()}" for part in rel_props.split(", "))
+        query = (
+            f"MATCH (a:Event {{id: $src}})-[r:{relation_type}]->(b:Event {{id: $dst}}) "
+            f"SET {set_clauses}"
+        )
+        params = {"src": source_id, "dst": target_id, **rel_params}
+        self.client.execute(query, parameters=params)
+
+    def _write_conflict(self, source_id: int, target_id: int, relation: CausalRelation, opposite: CausalRelation) -> None:
+        """Record that two events have contradictory causal claims between
+        them. Written both directions so either event's neighborhood surfaces
+        the disagreement; confidence is never part of this edge's semantics
+        (it exists purely as a disagreement flag with a running count)."""
+        existing_conflict = self._get_relation(source_id, target_id, "CONFLICTS")
+        count = (existing_conflict.conflict_count if existing_conflict else 0) + 1
+        conflict = CausalRelation(
             source_id=source_id,
             target_id=target_id,
-            relation_type=relation_type,
-            confidence=confidence,
-            mechanism=mechanism,
+            relation_type="CONFLICTS",
+            confidence=1.0,
+            mechanism=f"disagrees with {opposite.relation_type} {target_id}->{source_id}",
             timestamp=int(time.time()),
-            evidence=evidence or [],
+            conflict_count=count,
         )
-
-        query = (
-            f"MERGE (a:Event {{id: {relation.source_id}}})"
-            f"-[r:{relation.relation_type} {{{relation.props()}}}]"
-            f"->(b:Event {{id: {relation.target_id}}})"
-        )
-        self.client.execute(query)
-        return relation
+        if existing_conflict:
+            self._set_relation_props(source_id, target_id, "CONFLICTS", conflict)
+        else:
+            rel_props, rel_params = conflict.cypher_props(prefix="r")
+            query = (
+                "MERGE (a:Event {id: $src})"
+                f"-[r:CONFLICTS {{{rel_props}}}]"
+                "->(b:Event {id: $dst})"
+            )
+            self.client.execute(query, parameters={"src": source_id, "dst": target_id, **rel_params})
 
     def add_overwrite(
         self,
