@@ -1,0 +1,55 @@
+{
+  "source": "snap-research/locomo data/locomo10.json",
+  "seed": 42,
+  "per_conversation_n": 10,
+  "selection": "proportional stratified random by LoCoMo category, largest-remainder quotas, per conversation",
+  "conversations": [
+    {
+      "conv_id": "conv-26",
+      "total_qa": 199,
+      "selected_qa": 10,
+      "category_counts": {
+        "multi_hop": 1,
+        "single_hop": 1,
+        "open_domain": 3,
+        "adversarial": 5
+      },
+      "qa_idx": [
+        1,
+        19,
+        110,
+        113,
+        117,
+        157,
+        158,
+        160,
+        186,
+        195
+      ]
+    },
+    {
+      "conv_id": "conv-30",
+      "total_qa": 105,
+      "selected_qa": 10,
+      "category_counts": {
+        "multi_hop": 2,
+        "single_hop": 1,
+        "open_domain": 4,
+        "adversarial": 3
+      },
+      "qa_idx": [
+        0,
+        7,
+        31,
+        45,
+        51,
+        52,
+        54,
+        84,
+        102,
+        104
+      ]
+    }
+  ],
+  "total_samples": 20
+}
