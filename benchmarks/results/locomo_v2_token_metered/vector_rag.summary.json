@@ -1,0 +1,19 @@
+{
+  "n_queries": 20,
+  "qa_accuracy": 0.3,
+  "qa_accuracy_by_category": {
+    "1": 0.0,
+    "2": 0.0,
+    "4": 0.7142857142857143,
+    "5": 0.125
+  },
+  "mean_per_query_prompt_tokens": 485.8,
+  "mean_per_query_completion_tokens": 341.7,
+  "mean_per_query_total_tokens": 827.5,
+  "mean_per_query_seconds": 25.00607883959892,
+  "one_time_setup_tokens": {
+    "prompt_tokens": 27142,
+    "completion_tokens": 0
+  },
+  "one_time_setup_seconds": 10.838744249020237
+}
