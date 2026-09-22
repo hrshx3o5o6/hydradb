@@ -358,18 +358,36 @@ class CausalMemory:
         Find events on a topic (WHERE-only predicate; engine rejects CONTAINS).
         """
         query = (
-            'MATCH (e:Event) WHERE e.topic = "' + topic + '" '
+            "MATCH (e:Event) WHERE e.topic = $topic "
             "RETURN e.id, e.text, e.timestamp, e.session_id, e.type, e.topic "
             f"ORDER BY e.timestamp DESC LIMIT {limit}"
         )
-        return [self._event_from_row(row) for row in self.client.execute(query)]
+        return [self._event_from_row(row) for row in self.client.execute(query, parameters={"topic": topic})]
+
+    def _is_superseded(self, event_id: int) -> bool:
+        """True if some event OVERWRITES this one (i.e. it's not current)."""
+        query = "MATCH (x:Event)-[:OVERWRITES]->(e:Event {id: $id}) RETURN count(*) AS n"
+        rows = self.client.execute(query, parameters={"id": event_id})
+        return bool(rows) and int(rows[0].get("n") or 0) > 0
 
     def find_current_fact(self, topic: str) -> Optional[Event]:
         """
-        Find the most recent event on a topic (proxy for "current" fact).
+        Find the current (non-superseded) fact on a topic.
+
+        "Most recent same-topic event" is NOT the same thing as "current" --
+        an event can be the newest of its topic and still have been
+        explicitly OVERWRITTEN (e.g. overwrite bookkeeping lands out of
+        order, or a stale duplicate gets re-logged after its true successor).
+        Walk newest-first and return the first candidate with no incoming
+        OVERWRITES edge, matching the README's documented semantics
+        (`WHERE NOT (e)<-[:OVERWRITES]-()`) within the engine's WHERE-is-
+        property-comparison-only constraint (existence checks aren't
+        expressible in WHERE here, so it's done as a client-side walk).
         """
-        events = self.find_events_by_topic(topic, limit=1)
-        return events[0] if events else None
+        for event in self.find_events_by_topic(topic, limit=50):
+            if not self._is_superseded(event.id):
+                return event
+        return None
 
     def get_event(self, event_id: int) -> Optional[Event]:
         """Fetch a single event by id."""

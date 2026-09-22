@@ -171,11 +171,19 @@ CALL algo.SSpaths({
 ```
 
 ### Get current fact (not overwritten)
+The engine's WHERE clause only supports property comparisons, not pattern
+existence checks, so `find_current_fact()` does this as candidates + a
+client-side walk rather than a single query:
 ```cypher
-MATCH (e:Event {topic: "location"})
-WHERE NOT (e)<-[:OVERWRITES]-()
-RETURN e
+MATCH (e:Event) WHERE e.topic = $topic
+RETURN e.id, e.text, e.timestamp, e.session_id, e.type, e.topic
+ORDER BY e.timestamp DESC LIMIT 50
 ```
+then, newest first, for each candidate:
+```cypher
+MATCH (x:Event)-[:OVERWRITES]->(e:Event {id: $id}) RETURN count(*) AS n
+```
+returning the first candidate with `n = 0` (no incoming OVERWRITES edge).
 
 ## Features
 

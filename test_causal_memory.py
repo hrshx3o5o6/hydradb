@@ -21,9 +21,9 @@ def main():
     
     # Initialize memory
     memory = CausalMemory(
-        url="http://localhost:8443",
+        url="http://localhost:18444",
         auth_token="local-dev-auth-token-32-characters-long",
-        admin_url="http://localhost:9090"
+        admin_url="http://localhost:19090"
     )
     
     # Check connection
