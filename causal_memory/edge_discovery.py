@@ -11,68 +11,73 @@ Mode:
     --watch  poll forever (default), running discovery each time new events land
     --once   single pass, then exit (for loop-tick integration)
 
-Edge writes are idempotent (MERGE), so re-digesting overlapping windows is
-safe. Discovery state (seen event ids) is persisted to a small JSON file so
-restarting the daemon does not re-digest the whole history.
+Edge writes are idempotent (MATCH+SET on repeat proposals, see
+CausalMemory.add_causal_relation), so re-digesting overlapping windows is
+safe. Discovery state (last-processed timestamp) is a graph-backed
+watermark, ONE PER SESSION (CausalMemory.get_watermark/set_watermark) --
+not a local JSON file. A local file breaks the moment more than one daemon
+process (or agent session) writes events concurrently: two processes race
+on the same file, and neither's watermark reflects what the other already
+processed. Sharding by session_id also means one session's backlog doesn't
+block another's from being picked up.
 
 Run:
     source .venv/bin/activate
-    HYDRADB_URL=http://localhost:8443 python -m causal_memory.edge_discovery --watch
+    HYDRADB_URL=http://localhost:18444 python -m causal_memory.edge_discovery --watch
 """
 
 import argparse
-import json
 import os
 import sys
 import time
+from collections import defaultdict
 
 from causal_memory.memory import CausalMemory
 
-DEFAULT_URL = "http://localhost:8443"
-STATE_FILE = os.environ.get("EDGE_DISCOVERY_STATE", "/tmp/sgk-edge-discovery.json")
+DEFAULT_URL = "http://localhost:18444"
 POLL_SECONDS = 5
-DEFAULT_WINDOW = 30          # events fed to the LLM per discovery pass
-MAX_KNOWN_IDS = 5000
+DEFAULT_WINDOW = 30          # events fed to the LLM per discovery pass, per session
 
 
-def load_state():
+def run_once(mem: CausalMemory, window: int) -> int:
+    """
+    One discovery pass: group recent events by session, and for each session
+    with events newer than its graph-backed watermark, run discovery scoped
+    to that session and advance its watermark to the newest timestamp seen.
+
+    Returns total edges written across all sessions.
+    """
     try:
-        with open(STATE_FILE) as f:
-            return json.load(f).get("known_ids", [])
-    except (OSError, ValueError):
-        return []
-
-
-def save_state(known_ids):
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump({"known_ids": known_ids[-MAX_KNOWN_IDS:]}, f)
-    os.replace(tmp, STATE_FILE)
-
-
-def run_once(mem, known_ids, window):
-    """One discovery pass over events newer than the watermark. Returns stats."""
-    try:
-        events = mem._recent_events(limit=window)
+        events = mem._recent_events(limit=max(window * 4, 200))
     except Exception as e:
         print("[edge_discovery] read failed: %s" % e, file=sys.stderr)
-        return known_ids, 0
+        return 0
 
-    known = set(known_ids)
-    new_events = [e for e in events if e.id not in known]
-    if not new_events:
-        return known_ids, 0
+    by_session = defaultdict(list)
+    for e in events:
+        by_session[e.session_id].append(e)
 
-    ids = known_ids + [e.id for e in new_events]
-    print("[edge_discovery] %d new event(s), running causal discovery "
-          "(window=%d)…" % (len(new_events), window), flush=True)
-    try:
-        written = mem.extract_causality(window_events=window)
-    except Exception as e:
-        print("[edge_discovery] discovery failed: %s" % e, file=sys.stderr)
-        written = 0
-    print("[edge_discovery] %d edge(s) written" % written, flush=True)
-    return ids, written
+    total_written = 0
+    for session_id, session_events in by_session.items():
+        watermark = mem.get_watermark(session_id)
+        new_events = [e for e in session_events if watermark is None or e.timestamp > watermark]
+        if not new_events:
+            continue
+
+        print("[edge_discovery] session=%s: %d new event(s), running causal "
+              "discovery (window=%d)…" % (session_id, len(new_events), window), flush=True)
+        try:
+            written = mem.extract_causality(window_events=window, session_id=session_id)
+        except Exception as e:
+            print("[edge_discovery] discovery failed for session=%s: %s" % (session_id, e), file=sys.stderr)
+            written = 0
+
+        newest = max(e.timestamp for e in session_events)
+        mem.set_watermark(session_id, newest)
+        total_written += written
+        print("[edge_discovery] session=%s: %d edge(s) written" % (session_id, written), flush=True)
+
+    return total_written
 
 
 def main():
@@ -84,11 +89,9 @@ def main():
     args = ap.parse_args()
 
     mem = CausalMemory(url=args.url)
-    known_ids = load_state()
 
     while True:
-        known_ids, _ = run_once(mem, known_ids, args.window)
-        save_state(known_ids)
+        run_once(mem, args.window)
         if args.once:
             return
         time.sleep(POLL_SECONDS)

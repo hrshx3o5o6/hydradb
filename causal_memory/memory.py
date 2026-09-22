@@ -806,6 +806,83 @@ class CausalMemory:
         events = [self._event_from_row(row) for row in self.client.execute(query)]
         return list(reversed(events[:limit]))
 
+    def events_since(self, since_timestamp: Optional[int], session_id: Optional[str] = None,
+                      limit: int = 500) -> List[Event]:
+        """Events newer than `since_timestamp` (exclusive), oldest first, optionally
+        scoped to one session. Used by the discovery daemon's graph-backed watermark
+        instead of fetching+diffing the whole event set on every poll."""
+        clauses = []
+        params: Dict[str, Any] = {}
+        if session_id is not None:
+            clauses.append("e.session_id = $session_id")
+            params["session_id"] = session_id
+        if since_timestamp is not None:
+            clauses.append("e.timestamp > $since")
+            params["since"] = since_timestamp
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        query = (
+            f"MATCH (e:Event){where} "
+            "RETURN e.id, e.text, e.timestamp, e.session_id, e.type, e.topic "
+            "ORDER BY e.timestamp DESC"
+        )
+        events = [self._event_from_row(row) for row in self.client.execute(query, parameters=params)]
+        return list(reversed(events[:limit]))
+
+    # --------------------------------------------------------- watermarks
+
+    @staticmethod
+    def _watermark_id(session_id: str) -> int:
+        return hash_id(f"discovery-watermark:{session_id}")
+
+    def get_watermark(self, session_id: str) -> Optional[int]:
+        """
+        Last-processed event timestamp for a session's discovery daemon,
+        stored as a graph node (not a local file) so multiple daemon
+        processes/sessions share one source of truth and a restart doesn't
+        lose or race on state. Returns None if this session has never been
+        watermarked.
+        """
+        wid = self._watermark_id(session_id)
+        query = "MATCH (w:DiscoveryWatermark {id: $id}) RETURN w.last_timestamp"
+        rows = self.client.execute(query, parameters={"id": wid})
+        if not rows or rows[0].get("w.last_timestamp") is None:
+            return None
+        return int(rows[0]["w.last_timestamp"])
+
+    def set_watermark(self, session_id: str, last_timestamp: int) -> None:
+        """
+        Advance (never rewind) the graph-backed watermark for a session.
+
+        The engine's MERGE only executes one-hop edge patterns (a lone-vertex
+        MERGE is rejected -- same "CREATE requires an edge pattern" constraint
+        Event/Session already work around), so the watermark hangs off the
+        session's own anchor vertex rather than existing standalone.
+        """
+        current = self.get_watermark(session_id)
+        if current is not None and last_timestamp <= current:
+            return
+        session_root = hash_id(f"session:{session_id}")
+        wid = self._watermark_id(session_id)
+        if current is None:
+            query = (
+                "MERGE (s:Session {id: $sid, session_id: $session_id})"
+                "-[:HAS_WATERMARK]->(w:DiscoveryWatermark {id: $wid, "
+                "session_id: $session_id, last_timestamp: $ts, updated_at: $now})"
+            )
+        else:
+            # Node already exists (anchored to the session): update in place
+            # rather than MERGE-with-full-props, which would create a
+            # duplicate the moment last_timestamp differs from before (same
+            # class of bug fixed for edges in add_causal_relation).
+            query = (
+                "MATCH (w:DiscoveryWatermark {id: $wid}) "
+                "SET w.last_timestamp = $ts, w.updated_at = $now"
+            )
+        self.client.execute(query, parameters={
+            "sid": session_root, "wid": wid, "session_id": session_id,
+            "ts": last_timestamp, "now": int(time.time()),
+        })
+
     def add_conversation(
         self,
         messages: List[Dict[str, str]],
