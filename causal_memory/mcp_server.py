@@ -26,6 +26,8 @@ from typing import Any
 
 import json
 import mcp.types as types
+
+from . import discovery_core
 from mcp.server import Server, NotificationOptions
 from mcp.server.context import ServerRequestContext
 from mcp.server.models import InitializationOptions
@@ -149,8 +151,13 @@ async def list_tools() -> list[types.Tool]:
             name="link",
             description=(
                 "Persist a causal edge (source CAUSES target) with confidence "
-                "and a mechanism sentence. Idempotent (MERGE). This is the "
-                "'you reasoned it, we remember it' write."
+                "and a mechanism sentence. Repeated proposals for the same "
+                "pair append to provenance and may raise confidence (corroboration) "
+                "unless the opposite direction already has a causal edge, in "
+                "which case a CONFLICTS edge is recorded instead and confidence "
+                "is frozen. A stated mechanism with zero textual grounding in "
+                "the target event's text is rejected (deterministic check, no "
+                "LLM call) -- restate it referencing concrete terms."
             ),
             inputSchema={
                 "type": "object",
@@ -159,6 +166,7 @@ async def list_tools() -> list[types.Tool]:
                     "target_id": {"type": "integer"},
                     "confidence": {"type": "number"},
                     "mechanism": {"type": "string"},
+                    "proposer": {"type": "string", "description": "Identifies this harness/agent in the edge's provenance."},
                 },
                 "required": ["source_id", "target_id"],
             },
@@ -277,12 +285,26 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
                                           arguments.get("max_candidates", 60))
         return done(json.dumps(pairs))
     if name == "link":
+        mechanism = arguments.get("mechanism")
+        if mechanism:
+            src_ev = mem.get_event(arguments["source_id"])
+            dst_ev = mem.get_event(arguments["target_id"])
+            if src_ev and dst_ev and not discovery_core.passes_overlap_check(
+                src_ev.text, mechanism, dst_ev.text
+            ):
+                return done(
+                    "REJECTED: proposed mechanism shares no grounding with the "
+                    "target event's text (deterministic overlap check). If this "
+                    "is a genuine non-obvious causal link, restate the mechanism "
+                    "referencing concrete terms from the target event."
+                )
         r = mem.add_causal_relation(
             source_id=arguments["source_id"],
             target_id=arguments["target_id"],
             relation_type="CAUSES",
             confidence=float(arguments.get("confidence", 1.0)),
-            mechanism=arguments.get("mechanism"),
+            mechanism=mechanism,
+            proposer=arguments.get("proposer"),
         )
         return done(f"linked {r.source_id} CAUSES {r.target_id} (conf {r.confidence})")
     if name == "search":
@@ -320,14 +342,28 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
 
 
 def _candidate_pairs(mem, window_events: int, max_candidates: int):
-    """Temporally ordered (cause?, effect?, texts) pairs for the host LLM."""
+    """
+    Temporally ordered (cause?, effect?, texts) pairs for the host LLM.
+
+    Applies the SAME deterministic pre-filtering the SDK's extract_causality()
+    uses before it ever calls an LLM (discovery_core.dedup_by_text,
+    is_action_action_pair) -- mcp_server never calls an LLM itself (see
+    module docstring), but there's no reason a host driving this tool
+    should see lower-quality candidates than the SDK path: duplicate-text
+    noise and mechanical tool-tool ladders are filterable without any
+    causal judgment at all.
+    """
     events = mem._recent_events(limit=window_events)
     events.reverse()  # oldest -> newest
+    events = discovery_core.dedup_by_text(events)
     pairs = []
     for i in range(len(events)):
         for j in range(i + 1, len(events)):
-            ready = {"cause_id": events[i].id, "effect_id": events[j].id,
-                     "cause_text": events[i].text, "effect_text": events[j].text}
+            src, dst = events[i], events[j]
+            if discovery_core.is_action_action_pair(src.event_type, dst.event_type):
+                continue
+            ready = {"cause_id": src.id, "effect_id": dst.id,
+                     "cause_text": src.text, "effect_text": dst.text}
             pairs.append(ready)
             if len(pairs) >= max_candidates:
                 return pairs, window_events

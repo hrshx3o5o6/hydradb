@@ -16,6 +16,7 @@ import json
 import time
 from typing import Optional, List, Dict, Any
 
+from . import discovery_core
 from .client import HydraDBClient
 from .llm import LLM, LLMError, extract_json
 from .schema import Event, CausalRelation, CausalPath, hash_id
@@ -568,12 +569,18 @@ class CausalMemory:
         return answer.strip()
 
     def extract_causality(self, window_events: Optional[int] = 12,
-                          session_id: Optional[str] = None) -> int:
+                          session_id: Optional[str] = None,
+                          proposer: Optional[str] = None) -> int:
         """
         LLM proposes CAUSES edges between recent events (causal discovery).
 
         Batches the most recent events in timestamp order (optionally scoped
         to one session) and asks the LLM to propose cause-effect pairs.
+
+        `proposer` identifies this discovery run in each written edge's
+        provenance array (defaults to the scoped session_id, or a generic
+        tag) -- lets multi-agent/multi-session graphs tell corroboration
+        (independent runs agreeing) apart from a single run's own output.
 
         Returns the number of edges written.
         """
@@ -585,45 +592,22 @@ class CausalMemory:
         if len(events) < 2:
             return 0
 
+        proposer = proposer or (f"discovery:{session_id}" if session_id else "discovery:sdk")
+
         # Large streams are digested in overlapping temporal windows; a single
         # 80+ event digest makes the LLM under-propose and miss chain links.
-        windows = self._temporal_windows(events)
+        windows = discovery_core.temporal_windows(events)
         total = 0
         for win in windows:
-            total += self._discover_in_window(win)
+            total += self._discover_in_window(win, proposer=proposer)
         return total
 
-    def _temporal_windows(self, events: List[Event], size: int = 18, overlap: int = 6) -> List[List[Event]]:
-        """Split a sorted event list into overlapping windows."""
-        if len(events) <= size:
-            return [events]
-        windows = []
-        step = size - overlap
-        for start in range(0, len(events), step):
-            win = events[start : start + size]
-            if len(win) >= 2:
-                windows.append(win)
-            if start + size >= len(events):
-                break
-        return windows
-
-    def _discover_in_window(self, events: List[Event]) -> int:
+    def _discover_in_window(self, events: List[Event], proposer: Optional[str] = None) -> int:
         """Run LLM causal discovery over one window. Returns edges written."""
         llm = self._get_llm()
-        # Drop duplicate-text events: repeated mechanical actions (same tool
-        # invocation re-run, same log line) carry no causal signal and make the
-        # LLM chain near-identical texts together. Keep the first occurrence.
-        seen_texts = set()
-        uniq = []
-        for e in events:
-            key = (e.session_id, e.text)
-            if key in seen_texts:
-                continue
-            seen_texts.add(key)
-            uniq.append(e)
-        if len(uniq) < 2:
+        events = discovery_core.dedup_by_text(events)
+        if len(events) < 2:
             return 0
-        events = uniq
         digest_lines = []
         for i, e in enumerate(events):
             digest_lines.append(
@@ -685,24 +669,83 @@ class CausalMemory:
                 # action edges when a non-action event (user request, decision,
                 # result) is on one end. User->action and decision->result are
                 # the real signal; bash->bash ladders are not.
-                if (src.event_type == "action" and dst.event_type == "action"):
+                if discovery_core.is_action_action_pair(src.event_type, dst.event_type):
                     continue
                 conf = float(edge.get("confidence", 0.5))
                 conf = max(0.0, min(1.0, conf))
-                if conf < 0.8:
-                    continue  # weak/hallucinated links are noise, not memory
                 mech = edge.get("mechanism") or None
+
+                # Deterministic, non-LLM check: does the proposed edge have any
+                # textual/entity grounding beyond the proposer's confidence and
+                # temporal order? A confidently-proposed but ungrounded pair is
+                # the classic hallucination pattern -- reject before spending
+                # any more tokens on it.
+                if not discovery_core.passes_overlap_check(src.text, mech or "", dst.text):
+                    continue
+
+                band = discovery_core.route_confidence(conf)
+                if band == "reject":
+                    continue
+                if band == "verify":
+                    # Narrow, separate interventional check -- NOT the same
+                    # global-window call that proposed this edge (a single
+                    # judgment call degrades sharply as the candidate set
+                    # grows; see the kernel-obstruction finding this gate is
+                    # built against). Gated to the uncertain band only: this
+                    # is the ~16-25x-cheaper alternative to verifying every
+                    # edge, since blanket verification would itself burn the
+                    # token budget this whole project is trying to save.
+                    necessary = self._verify_necessity(llm, src.text, mech, dst.text)
+                    if necessary is False:
+                        continue  # target would plausibly have happened anyway
+                    if necessary is True:
+                        conf = max(conf, discovery_core.VERIFY_BELOW)
+
                 self.add_causal_relation(
                     source_id=src.id,
                     target_id=dst.id,
                     relation_type="CAUSES",
                     confidence=conf,
                     mechanism=mech,
+                    proposer=proposer,
                 )
                 written += 1
             except (TypeError, ValueError):
                 continue
         return written
+
+    def _verify_necessity(self, llm: LLM, src_text: str, mechanism: Optional[str], dst_text: str) -> Optional[bool]:
+        """
+        Narrow counterfactual check for edges in the 0.70-0.85 confidence
+        band: would the target plausibly have occurred without the source?
+        Returns True if the source looks necessary (raise confidence),
+        False if the target looks independent of it (reject), None if the
+        LLM call itself failed (treat as "leave confidence as proposed").
+        """
+        try:
+            resp = llm.complete(
+                system=(
+                    "You judge ONE candidate cause-effect pair in isolation. "
+                    "Answer whether the effect would PLAUSIBLY still have "
+                    "happened without the cause. Return JSON only: "
+                    '{"would_happen_anyway": true|false, "reason": "<one sentence>"}.'
+                ),
+                user=(
+                    f"Candidate cause: {src_text}\n"
+                    f"Proposed mechanism: {mechanism or '(none stated)'}\n"
+                    f"Candidate effect: {dst_text}"
+                ),
+                json_mode=True,
+            )
+            data = extract_json(resp)
+            would_happen_anyway = data.get("would_happen_anyway")
+            if would_happen_anyway is True:
+                return False  # effect independent of cause -> not necessary
+            if would_happen_anyway is False:
+                return True  # cause looks necessary -> raise confidence
+            return None
+        except Exception:
+            return None
 
     def reset(self) -> None:
         """Wipe all events, sessions, and causal edges (demo cleanup)."""
